@@ -53,7 +53,7 @@ Separate **confirmed implementation facts** from **pending decisions**. Do not t
 | **Pending** | Candle **coverage measurement** in a durable ops environment (beyond local worker logs). |
 | **Pending** | Production environment configuration review (auth fail-closed, secrets, Supabase RLS, worker schedules, `E2E_BYPASS_AUTH` never set in prod). |
 | **Confirmed in code** | Dashboard metrics fields `volume_change_24h` / platform `*_change_24h` are still returned as **`null`** (not computed). |
-| **Confirmed in code** | Live price-stream subscription loads at most **150** active markets per venue (`priceStream.ts`). |
+| **Confirmed in code** | Live price-stream default cap remains **150** markets/venue (`PRICE_STREAM_MARKET_LIMIT`, hard max 400). P4 selects fairly (watch/volume/rotate) inside that cap — see `P4_COVERAGE_DESIGN.md` / `P4_IMPLEMENTATION_REPORT.md`. |
 
 P0 auth fail-closed behavior remains: production never honors `E2E_BYPASS_AUTH` (`frontend/src/lib/auth/authGate.ts`).
 
