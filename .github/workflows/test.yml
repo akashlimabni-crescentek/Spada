@@ -1,0 +1,153 @@
+# Review-workspace CI: unit + mocked always; LIVE API/E2E only when services are available.
+name: test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  backend-unit:
+    name: Backend unit + mocked contracts
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend/Spada_Backend/fastify-backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/Spada_Backend/fastify-backend/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run test:unit
+      - run: npm run test:integration:mock
+
+  frontend-unit:
+    name: Frontend unit + typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run test:market-title
+      - run: npm run test:auth-gate
+
+  # LIVE jobs are optional: they need secrets + long-running workers.
+  # Enable by setting repository variable SPADA_RUN_LIVE_TESTS=true and providing
+  # SUPABASE_* / KALSHI_* secrets on a self-hosted or dedicated runner with services.
+  backend-live-integration:
+    name: Backend LIVE integration (optional)
+    if: ${{ vars.SPADA_RUN_LIVE_TESTS == 'true' }}
+    runs-on: ubuntu-latest
+    needs: backend-unit
+    defaults:
+      run:
+        working-directory: backend/Spada_Backend/fastify-backend
+    env:
+      SPADA_API_BASE: http://127.0.0.1:4000
+      SPADA_INTEGRATION_REQUIRE: "1"
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      CLIENT_ORIGIN: http://127.0.0.1:3000
+      KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+      KALSHI_PRIVATE_KEY_B64: ${{ secrets.KALSHI_PRIVATE_KEY_B64 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: backend/Spada_Backend/fastify-backend/package-lock.json
+      - run: npm ci
+      - name: Start API
+        run: |
+          npm run dev > /tmp/spada-api.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:4000/api/v1/markets/metrics >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API failed to become ready"; tail -n 100 /tmp/spada-api.log; exit 1
+      - run: npm run test:integration
+
+  frontend-live-e2e:
+    name: Frontend LIVE E2E (optional)
+    if: ${{ vars.SPADA_RUN_LIVE_TESTS == 'true' }}
+    runs-on: ubuntu-latest
+    needs: [frontend-unit, backend-live-integration]
+    defaults:
+      run:
+        working-directory: frontend
+    env:
+      SPADA_E2E_BASE_URL: http://localhost:3000
+      SPADA_API_BASE: http://127.0.0.1:4000
+      NEXT_PUBLIC_API_URL: http://127.0.0.1:4000
+      E2E_BYPASS_AUTH: "true"
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            backend/Spada_Backend/fastify-backend/package-lock.json
+      - name: Install backend + start API
+        working-directory: backend/Spada_Backend/fastify-backend
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          CLIENT_ORIGIN: http://localhost:3000
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+          KALSHI_PRIVATE_KEY_B64: ${{ secrets.KALSHI_PRIVATE_KEY_B64 }}
+        run: |
+          npm ci
+          npm run dev > /tmp/spada-api.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:4000/api/v1/markets/metrics >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API failed to become ready"; tail -n 100 /tmp/spada-api.log; exit 1
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Start Next.js
+        run: |
+          npm run dev > /tmp/spada-web.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:3000 >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Frontend failed to become ready"; tail -n 100 /tmp/spada-web.log; exit 1
+      - run: npm run test:e2e
+        env:
+          CI: "true"
