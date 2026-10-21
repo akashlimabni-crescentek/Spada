@@ -428,7 +428,11 @@ export function createOhlcvChart(
     // Slow lane — immutable completed history only.
     setHistory(rows, options = {}) {
       const fit = options.fit === true;
-      const visibleRange = fit ? null : chart.timeScale().getVisibleLogicalRange();
+      const timeScale = chart.timeScale();
+      // setData() resets the time scale. Keep the user's zoom (bar spacing)
+      // and the window they were looking at.
+      const visibleRange = fit ? null : timeScale.getVisibleLogicalRange();
+      const barSpacing = fit ? null : timeScale.options().barSpacing;
       applyProbabilityFormat(rows);
 
       candleByTime.clear();
@@ -440,9 +444,14 @@ export function createOhlcvChart(
       lastChartCandles = chartCandles;
 
       if (fit) {
-        chart.timeScale().fitContent();
-      } else if (visibleRange) {
-        chart.timeScale().setVisibleLogicalRange(visibleRange);
+        timeScale.fitContent();
+      } else {
+        if (barSpacing != null && Number.isFinite(barSpacing)) {
+          timeScale.applyOptions({ barSpacing });
+        }
+        if (visibleRange) {
+          timeScale.setVisibleLogicalRange(visibleRange);
+        }
       }
     },
 
@@ -711,7 +720,11 @@ export function createMultiLineChart(
   return {
     setLines(lines, options = {}) {
       const fit = options.fit === true;
-      const visibleRange = fit ? null : chart.timeScale().getVisibleLogicalRange();
+      // Stay on the live edge the way a trading chart does. Restoring the old
+      // logical range after an append pushes the new point off-screen.
+      const followLive = !fit && chart.timeScale().scrollPosition() < 2;
+      const visibleRange =
+        fit || followLive ? null : chart.timeScale().getVisibleLogicalRange();
       const nextIds = new Set(lines.map((line) => line.id));
 
       for (const [id, series] of seriesById) {

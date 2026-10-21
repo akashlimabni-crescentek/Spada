@@ -12,6 +12,7 @@
     "test:landing-demo": "npx --yes tsx src/lib/landing/landingDemoDisclosure.test.ts",
     "test:api-base": "npx --yes tsx src/lib/apiBase.test.ts",
     "test:e2e": "playwright test",
+    "test:verify": "node ../scripts/verify-live.mjs",
     "test:e2e:auth-redirect": "playwright test e2e/single-market.spec.ts -g \"protected route redirects\"",
     "test:e2e:install": "playwright install chromium",
     "test": "npm run test:market-title && npm run test:auth-gate && npm run test:landing-demo && npm run test:api-base"

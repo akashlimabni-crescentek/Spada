@@ -23,20 +23,51 @@ async function resolveMarketId(): Promise<string> {
     return process.env.SPADA_E2E_MARKET_ID.trim();
   }
 
-  const res = await fetch(`${API_BASE}/api/v1/markets?platform=polymarket&limit=20`);
-  if (!res.ok) {
-    throw new Error(
-      `Cannot discover market id: API ${API_BASE} returned ${res.status}. Start the backend or set SPADA_E2E_MARKET_ID.`
+  const events: string[] = [];
+  for (const offset of [0, 100, 200, 300]) {
+    const res = await fetch(
+      `${API_BASE}/api/v1/markets?platform=polymarket&limit=100&offset=${offset}`
     );
+    if (!res.ok) {
+      throw new Error(
+        `Cannot discover market id: API ${API_BASE} returned ${res.status}. Start the backend or set SPADA_E2E_MARKET_ID.`
+      );
+    }
+    const body = (await res.json()) as { markets?: Array<{ canonical_id?: string }> };
+    for (const market of body.markets ?? []) {
+      const id = market.canonical_id;
+      if (typeof id === "string" && id.includes("_event_")) events.push(id);
+    }
+    if (events.length >= 24) break;
   }
-  const body = (await res.json()) as { markets?: Array<{ canonical_id?: string }> };
-  const markets = body.markets ?? [];
-  const binary = markets.find((m) => m.canonical_id && !m.canonical_id.includes("_event_"));
-  const id = binary?.canonical_id ?? markets[0]?.canonical_id;
-  if (!id) {
-    throw new Error("No markets returned from API — cannot run single-market E2E.");
+
+  // Stored history answers in about a second. A miss falls through to the
+  // venue, so probe a few events at once and keep the first real series.
+  const probe = async (id: string): Promise<string | null> => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 4_000);
+    try {
+      const candles = await fetch(
+        `${API_BASE}/api/v1/markets/${encodeURIComponent(id)}/candles?resolution=1h`,
+        { signal: ctrl.signal }
+      );
+      if (!candles.ok) return null;
+      const json = (await candles.json()) as { candles?: unknown[] };
+      return Array.isArray(json.candles) && json.candles.length > 0 ? id : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  for (let i = 0; i < events.length && i < 24; i += 6) {
+    const found = (await Promise.all(events.slice(i, i + 6).map(probe))).find(Boolean);
+    if (found) return found;
   }
-  return id;
+  throw new Error(
+    "No polymarket event with stored candles in the scanned pages. Set SPADA_E2E_MARKET_ID."
+  );
 }
 
 async function assertNoSyntheticCandleResponses(page: Page) {
@@ -119,6 +150,42 @@ test.describe("single-market journey (LIVE)", () => {
   }) => {
     const marketId = await resolveMarketId();
     const finishCandleCheck = await assertNoSyntheticCandleResponses(page);
+    const consoleErrors: string[] = [];
+    const pageErrors: string[] = [];
+    const httpErrors: string[] = [];
+    const wsFrames: string[] = [];
+
+    page.on("pageerror", (err) => pageErrors.push(String(err)));
+    page.on("console", (msg) => {
+      if (msg.type() !== "error") return;
+      const text = msg.text();
+      if (/favicon|Download the React DevTools/i.test(text)) return;
+      // Chrome logs a resource failure with no URL. Those are judged from httpErrors.
+      if (/^Failed to load resource:/i.test(text)) return;
+      consoleErrors.push(text);
+    });
+    page.on("response", (response) => {
+      if (response.status() < 400) return;
+      const url = response.url();
+      if (/favicon|chrome-extension:|manifest\.webmanifest/i.test(url)) return;
+      // Bypass opens the page without a Supabase session, so profile and
+      // watchlist stay 401. That is not a chart regression.
+      if (response.status() === 401 && /supabase\.co|\/api\/v1\/me|\/api\/v1\/watchlist/i.test(url)) {
+        return;
+      }
+      // Polymarket CLOB timeouts are a venue condition. The Kalshi book is
+      // covered by the API integration test.
+      if (/\/orderbook(?:\?|$)/.test(url) && (response.status() === 404 || response.status() >= 500)) {
+        return;
+      }
+      httpErrors.push(`${response.status()} ${url}`);
+    });
+    page.on("websocket", (ws) => {
+      ws.on("framereceived", (frame) => {
+        const payload = String(frame.payload ?? "");
+        if (payload) wsFrames.push(payload);
+      });
+    });
 
     await page.goto(`/singleMarket/${encodeURIComponent(marketId)}`);
 
@@ -167,6 +234,39 @@ test.describe("single-market journey (LIVE)", () => {
         "chart canvas present but all /candles responses were empty"
       ).toBe(true);
     }
+
+    await page.getByRole("tab", { name: "OHLCV" }).click();
+    for (const timeframe of ["15m", "1h"]) {
+      await page.getByRole("tab", { name: timeframe, exact: true }).click();
+      await expect(page.getByTestId("market-chart").locator("canvas").first()).toBeVisible({
+        timeout: 45_000,
+      });
+    }
+    await expect
+      .poll(() => candleHits.some((hit) => hit.url.includes("resolution=1h")), {
+        timeout: 20_000,
+      })
+      .toBe(true);
+
+    await expect
+      .poll(
+        () =>
+          wsFrames.some(
+            (frame) => frame.includes("CONNECTED") || frame.includes("SUBSCRIBED")
+          ),
+        { timeout: 20_000 }
+      )
+      .toBe(true);
+    await expect
+      .poll(
+        () => wsFrames.some((frame) => frame.includes("PRICE_UPDATE")),
+        { timeout: 20_000 }
+      )
+      .toBe(true);
+
+    expect(pageErrors, `uncaught page errors:\n${pageErrors.join("\n")}`).toEqual([]);
+    expect(consoleErrors, `console errors:\n${consoleErrors.join("\n")}`).toEqual([]);
+    expect(httpErrors, `unexpected HTTP errors:\n${httpErrors.join("\n")}`).toEqual([]);
 
     // Orderbook: levels, no-orders, or unavailable card — one of the honest states.
     const orderbook = page

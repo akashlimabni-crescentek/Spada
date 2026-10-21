@@ -136,6 +136,8 @@ export function buildFormingCandle(params: {
   ladder?: CandleResolution[];
   finerRowsByInterval: Partial<Record<CandleResolution, NormalizedCandle[]>>;
   liveTail: LiveCandle | null;
+  /** Set false to silence the `[candle] compose` log (hot per-frame path). */
+  log?: boolean;
 }): ComposeResult {
   const {
     interval,
@@ -144,6 +146,7 @@ export function buildFormingCandle(params: {
     finerRowsByInterval,
     liveTail,
   } = params;
+  const shouldLog = params.log === true;
   const ladder = params.ladder ?? SUB_INTERVAL_LADDER[interval];
   const pieces: FormingPiece[] = [];
   let cursor = bucketStart;
@@ -182,7 +185,18 @@ export function buildFormingCandle(params: {
     });
   }
 
-  if (pieces.length === 0) return { candle: null, pieces };
+  if (pieces.length === 0) {
+    if (shouldLog) {
+      console.log("[candle] compose forming candle", {
+        interval,
+        bucketStart: new Date(bucketStart).toISOString(),
+        now: new Date(nowMs).toISOString(),
+        result: "no pieces — forming candle empty",
+        sources: { historyTable: [], realtime: [] },
+      });
+    }
+    return { candle: null, pieces };
+  }
 
   const first = pieces[0];
   const last = pieces[pieces.length - 1];
@@ -195,16 +209,54 @@ export function buildFormingCandle(params: {
     volume += p.volume;
   }
 
-  return {
-    candle: {
-      time: Math.floor(bucketStart / 1000),
-      open: first.open,
-      high,
-      low,
-      close: last.close,
-      volume,
-      mid: liveTail?.mid ?? null,
-    },
-    pieces,
+  const candle: LiveCandle = {
+    time: Math.floor(bucketStart / 1000),
+    open: first.open,
+    high,
+    low,
+    close: last.close,
+    volume,
+    mid: liveTail?.mid ?? null,
   };
+
+  if (shouldLog) {
+    const dbPieces = pieces.filter((p) => p.src.startsWith("db:"));
+    const livePieces = pieces.filter((p) => p.src === "live");
+    const dbRows = dbPieces.map((p) => ({
+      src: p.src,
+      from: new Date(p.fromMs).toISOString(),
+      to: new Date(p.toMs).toISOString(),
+      o: p.open,
+      h: p.high,
+      l: p.low,
+      c: p.close,
+      v: p.volume,
+    }));
+    const liveRows = livePieces.map((p) => ({
+      from: new Date(p.fromMs).toISOString(),
+      to: new Date(p.toMs).toISOString(),
+      o: p.open,
+      h: p.high,
+      l: p.low,
+      c: p.close,
+      v: p.volume,
+    }));
+    console.log("[candle] compose forming candle", {
+      interval,
+      bucketStart: new Date(bucketStart).toISOString(),
+      now: new Date(nowMs).toISOString(),
+      ladder,
+      merged: { o: candle.open, h: candle.high, l: candle.low, c: candle.close, v: candle.volume },
+    });
+    if (dbRows.length > 0) {
+      console.log("[candle] compose — history-table pieces", dbRows);
+      console.table(dbRows);
+    }
+    if (liveRows.length > 0) {
+      console.log("[candle] compose — realtime pieces", liveRows);
+      console.table(liveRows);
+    }
+  }
+
+  return { candle, pieces };
 }

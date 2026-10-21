@@ -18,8 +18,8 @@ This workspace has two packages with different test layers. **Unit / mocked** te
 cd backend/Spada_Backend/fastify-backend
 npm run test:unit              # ratios, matching, candles, orderbook helpers
 npm run test:integration:mock  # response-shape helpers (no network)
-npm run test:integration       # LIVE HTTP contracts (skips if API down unless SPADA_INTEGRATION_REQUIRE=1)
-npm test                       # unit + mock + live
+npm run test:integration       # LIVE HTTP contracts. Exits 1 if the API is down.
+npm test                       # unit + mock only (no server). Live checks are not a silent pass.
 ```
 
 LIVE integration covers: market 404, market details + volume fields, candles for `5m/15m/1h/4h/1d/1w` with **no `_tempStatic`**, orderbook shape or honest error, ratios/matching payload.
@@ -29,7 +29,7 @@ Candle sync (backend worker, not a separate npm script): boot+20s then every 15m
 Env:
 
 - `SPADA_API_BASE` — API origin (default `http://127.0.0.1:4000`)
-- `SPADA_INTEGRATION_REQUIRE=1` — fail if API unreachable (CI with a started backend)
+- `SPADA_INTEGRATION_ALLOW_SKIP=1` — old opt-in: exit 0 when the API is down. The default is to fail.
 - `CANDLE_SYNC_MARKET_LIMIT` — markets per candle-sync cycle (default 40, max 200)
 - `CANDLE_SYNC_WATCH_SHARE` — fraction reserved for watchlist markets (default 0.25)
 - `CANDLE_SYNC_VOLUME_SHARE` — fraction reserved for high-volume markets (default 0.35)
@@ -89,12 +89,15 @@ Terminal B:
 cd frontend && npm run dev
 ```
 
-Then:
+Then one command from the repo root. It checks that both servers answer HTTP before any test runs, fails if they do not, and does not stop a server it did not start:
 
 ```bash
-cd backend/Spada_Backend/fastify-backend && SPADA_INTEGRATION_REQUIRE=1 npm run test:integration
-cd frontend && npm run test:e2e
+node scripts/verify-live.mjs
 ```
+
+From `frontend`, the same script is `npm run test:verify`.
+
+`volume_change_24h` and the platform trend fields are `null` until a stored metrics sample is about 24 hours old. That null is intentional. The LIVE suite checks the field types and does not invent a percent.
 
 ## CI
 

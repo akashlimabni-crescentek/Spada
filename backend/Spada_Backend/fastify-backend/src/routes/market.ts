@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { supabaseAdmin } from '../lib/supabase.js';
+import { loadAndUpdateDashboardTrends } from '../lib/dashboardMetrics.js';
 import { orderbookStore } from '../services/orderbookStore.js';
 import {
   candleAggregator,
@@ -7,6 +8,16 @@ import {
   isCandleResolution,
   type CandleResolution,
 } from '../services/candleAggregator.js';
+
+/** Chart outcome index. Missing means the primary series (unchanged). */
+function parseOutcomeIndex(raw: string | undefined): number | null {
+  if (raw == null || raw === '') return 0;
+  if (!/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  // Events can list well over 64 outcomes (a college game book had 215).
+  if (!Number.isInteger(n) || n < 0 || n > 1024) return null;
+  return n;
+}
 
 function parseArrayField(val: any): any[] {
   if (Array.isArray(val)) return val;
@@ -254,17 +265,23 @@ async function loadMetrics() {
     totalVolume += Number(m.volume || 0);
   }
 
+  const totalVolumeUsd = Math.round(totalVolume);
+  const trends = await loadAndUpdateDashboardTrends({
+    polymarketActive: polymarketCount,
+    kalshiActive: kalshiCount,
+    totalVolumeUsd,
+  });
   const metrics = {
     total_active_markets: all.length,
     polymarket_active_count: polymarketCount,
-    polymarket_trend: null,
-    polymarket_change_24h: null,
+    polymarket_trend: trends.polymarket_trend,
+    polymarket_change_24h: trends.polymarket_change_24h,
     kalshi_active_count: kalshiCount,
-    kalshi_trend: null,
-    kalshi_change_24h: null,
-    total_volume_usd: Math.round(totalVolume),
-    volume_trend: null,
-    volume_change_24h: null,
+    kalshi_trend: trends.kalshi_trend,
+    kalshi_change_24h: trends.kalshi_change_24h,
+    total_volume_usd: totalVolumeUsd,
+    volume_trend: trends.volume_trend,
+    volume_change_24h: trends.volume_change_24h,
     last_updated: new Date().toISOString(),
   };
   writeDashboardCache('metrics', metrics);
@@ -449,10 +466,21 @@ export async function marketRoutes(fastify: FastifyInstance) {
   // 8. GET /api/v1/markets/:id/candles?resolution=5m|15m|1h|4h|1d|1w
   // Unknown market → 404 (same as GET /markets/:id). Known market with no
   // history → 200 + { candles: [] }.
+  // from+to → stored bars in that window only (no forming candle, no newest-N trim).
+  // The chart uses that for finer blocks inside the open bucket.
   fastify.get('/api/v1/markets/:id/candles', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const query = request.query as { resolution?: string };
+    const query = request.query as {
+      resolution?: string;
+      from?: string;
+      to?: string;
+      outcome?: string;
+    };
     const resolutionParam = query.resolution ?? '1h';
+    const outcomeIndex = parseOutcomeIndex(query.outcome);
+    if (outcomeIndex == null) {
+      return reply.status(400).send({ error: 'outcome must be a whole number from 0 to 1024' });
+    }
 
     if (!isCandleResolution(resolutionParam)) {
       return reply.status(400).send({
@@ -470,8 +498,38 @@ export async function marketRoutes(fastify: FastifyInstance) {
       return reply.status(404).send({ error: 'Market not found' });
     }
 
+    const hasFrom = query.from != null && query.from !== '';
+    const hasTo = query.to != null && query.to !== '';
+    if (hasFrom !== hasTo) {
+      return reply.status(400).send({ error: 'from and to must be sent together' });
+    }
+
     try {
-      const candles = await candleAggregator.getCandles(id, resolutionParam as CandleResolution);
+      if (hasFrom && hasTo) {
+        const fromMs = Date.parse(String(query.from));
+        const toMs = Date.parse(String(query.to));
+        if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs < fromMs) {
+          return reply.status(400).send({ error: 'from and to must be valid timestamps' });
+        }
+        const maxWindowMs = 14 * 24 * 60 * 60 * 1000;
+        if (toMs - fromMs > maxWindowMs) {
+          return reply.status(400).send({ error: 'from/to window cannot exceed 14 days' });
+        }
+        const candles = await candleAggregator.getCandlesSince(
+          id,
+          resolutionParam as CandleResolution,
+          fromMs,
+          toMs,
+          outcomeIndex
+        );
+        return reply.status(200).send({ candles });
+      }
+
+      const candles = await candleAggregator.getCandles(
+        id,
+        resolutionParam as CandleResolution,
+        outcomeIndex
+      );
       // Honest empty history: known market with no bars → 200 + []. Never invent OHLCV.
       return reply.status(200).send({ candles });
     } catch (err: any) {

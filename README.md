@@ -53,11 +53,10 @@ cd backend/Spada_Backend/fastify-backend && npm run test:unit && npm run test:in
 cd frontend && npm run test:market-title
 ```
 
-LIVE API + browser (apps must already be running):
+LIVE API + browser (one command; fails if either server is not ready):
 
 ```bash
-cd backend/Spada_Backend/fastify-backend && SPADA_INTEGRATION_REQUIRE=1 npm run test:integration
-cd frontend && npm run test:e2e
+node scripts/verify-live.mjs
 ```
 
 E2E uses system Google Chrome (`channel: chrome`). On macOS 13+ you can instead install Playwright’s Chromium with `npm run test:e2e:install`. After changing `allowedDevOrigins` in `next.config.ts`, restart `next dev`.

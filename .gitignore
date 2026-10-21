@@ -28,6 +28,9 @@ frontend/playwright-report/
 frontend/blob-report/
 frontend/playwright/.cache/
 
+# Dashboard 24h metric samples (local, not source)
+backend/**/data/
+
 # Backend build / test artifacts
 backend/**/dist/
 backend/**/coverage/

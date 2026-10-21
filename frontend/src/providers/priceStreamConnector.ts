@@ -173,10 +173,16 @@ export function PriceStreamConnector() {
         nextSocket.onmessage = (event) => {
           try {
             const msg = JSON.parse(event.data);
+            if (msg.type === "CONNECTED" || msg.type === "SUBSCRIBED") {
+              console.log("[WebSocket] subscribed (waiting for data)", msg);
+            }
             if (msg.type === "PRICE_UPDATE") {
-              // Log only for markets scoped via watchMarket (logging helper, not WS sub).
               const watched = usePriceStore.getState().watchedMarketIds;
-              if (watched.has(msg.canonical_id)) {
+              const onThisPage =
+                subscribeAllRefCount > 0 ||
+                marketRefCounts.has(msg.canonical_id) ||
+                watched.has(msg.canonical_id);
+              if (onThisPage) {
                 console.log("[WebSocket] data received", {
                   type: msg.type,
                   canonical_id: msg.canonical_id,

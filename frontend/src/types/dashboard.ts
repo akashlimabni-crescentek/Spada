@@ -57,7 +57,7 @@ export  interface HighVolumeMarket {
 export interface MarketMetrics {
   total_active_markets: number;
   polymarket_active_count: number;
-  /** Null until real 24h snapshots exist — never invent. */
+  /** Null until a stored sample about 24h old exists. Never invented. */
   polymarket_trend: "up" | "down" | null;
   polymarket_change_24h: string | null;
   kalshi_active_count: number;

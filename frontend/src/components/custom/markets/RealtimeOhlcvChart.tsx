@@ -12,6 +12,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { aggregateCandles } from "@/lib/candles/aggregateCandles";
 import {
+  formatCandleRowForLog,
+  logCandleRows,
+  logCandleRowsByInterval,
+} from "@/lib/candles/candleDebug";
+import {
   CandleAggregator,
   bucketStartMs,
   priceToEvent,
@@ -59,10 +64,19 @@ type RealtimeOhlcvChartProps = {
 
 async function fetchCandles(
   marketId: string,
-  resolution: CandleResolution
+  resolution: CandleResolution,
+  window?: { fromMs: number; toMs: number },
+  outcomeIndex = 0
 ): Promise<NormalizedCandle[]> {
   const base = getApiBaseUrl();
-  const url = `${base}/api/v1/markets/${encodeURIComponent(marketId)}/candles?resolution=${encodeURIComponent(resolution)}`;
+  const params = new URLSearchParams({ resolution });
+  if (window) {
+    params.set("from", new Date(window.fromMs).toISOString());
+    params.set("to", new Date(window.toMs).toISOString());
+  }
+  // Binary No stays 1 − Yes. Other outcomes have their own token history.
+  if (outcomeIndex > 0) params.set("outcome", String(outcomeIndex));
+  const url = `${base}/api/v1/markets/${encodeURIComponent(marketId)}/candles?${params.toString()}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`candles ${res.status}`);
   return normalizeCandles(await res.json());
@@ -97,6 +111,9 @@ export function RealtimeOhlcvChart({
 }: RealtimeOhlcvChartProps) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+
+  const fallbackPricesRef = useRef(fallbackPrices);
+  fallbackPricesRef.current = fallbackPrices;
 
   const handleRef = useRef<OhlcvChartHandle | null>(null);
   const chartReadyRef = useRef<Promise<OhlcvChartHandle | null>>(Promise.resolve(null));
@@ -157,7 +174,7 @@ export function RealtimeOhlcvChart({
     };
   }, [height]);
 
-  const paintForming = useCallback(() => {
+  const paintForming = useCallback((log = false) => {
     const handle = handleRef.current;
     const cfg = configRef.current;
     if (!handle || !historyReadyRef.current || !cfg) return;
@@ -171,9 +188,18 @@ export function RealtimeOhlcvChart({
       ladder: cfg.ladder,
       finerRowsByInterval: finerRowsRef.current,
       liveTail: aggregatorRef.current?.current ?? null,
+      log,
     });
     if (!candle) return;
     handle.updateLive(candle);
+    if (log) {
+      console.log("[candle] chart update (forming candle)", {
+        source: "composed",
+        interval: cfg.resolution,
+        row: formatCandleRowForLog(candle, cfg.resolution),
+      });
+      console.table([formatCandleRowForLog(candle, cfg.resolution)]);
+    }
   }, []);
 
   const scheduleFlush = useCallback(() => {
@@ -186,16 +212,10 @@ export function RealtimeOhlcvChart({
 
   // Load history + live subscribe for this (market, resolution, outcome) key.
   useEffect(() => {
-    if (!binary && selectedOutcome > 0) {
-      const emptyId = requestAnimationFrame(() => setStatus("empty"));
-      return () => cancelAnimationFrame(emptyId);
-    }
-
     const token = ++tokenRef.current;
     historyReadyRef.current = false;
-    const loadingId = requestAnimationFrame(() => {
-      if (token === tokenRef.current) setStatus("loading");
-    });
+    const outcomeIndex = !binary && selectedOutcome > 0 ? selectedOutcome : 0;
+    setStatus("loading");
 
     const bucketMs = RESOLUTION_MS[resolution];
     const ladder = SUB_INTERVAL_LADDER[resolution];
@@ -213,6 +233,14 @@ export function RealtimeOhlcvChart({
     let finerFetchSeq = 0;
     let tickSeq = 0;
 
+    console.log("[candle] chart session start", {
+      marketId,
+      interval: resolution,
+      ladder,
+      finerRefetchIntervalMs: FINER_REFETCH_MS,
+      refetchTriggers: ["initial", "bucket-roll", "periodic", "resync"],
+    });
+
     const loadHistory = async (fit: boolean) => {
       // Wait for chart create so setHistory is never dropped on a null handle.
       await chartReadyRef.current;
@@ -221,11 +249,24 @@ export function RealtimeOhlcvChart({
       const aggregateCfg = CLIENT_AGGREGATE_FROM[resolution];
       let rows = await fetchCandles(
         marketId,
-        aggregateCfg?.source ?? resolution
+        aggregateCfg?.source ?? resolution,
+        undefined,
+        outcomeIndex
       );
       rows = mapOutcome(rows, binary, selectedOutcome);
       if (aggregateCfg) {
+        console.log("[candle] history aggregate", {
+          source: "history-table",
+          interval: resolution,
+          sourceInterval: aggregateCfg.source,
+          rowCountBefore: rows.length,
+        });
         rows = aggregateCandles(rows, aggregateCfg.aggregateMs);
+        console.log("[candle] history aggregate done", {
+          source: "history-table",
+          interval: resolution,
+          rowCountAfter: rows.length,
+        });
       }
       // Gap-fill is owned by the backend candle API — do not re-fill here.
 
@@ -233,21 +274,59 @@ export function RealtimeOhlcvChart({
       const bucketStartSec = Math.floor(bucketStart / 1000);
       // Forming bucket is owned by composition — strip from immutable history.
       const completed = stripFormingBucket(rows, bucketStartSec);
+      const droppedForming = rows.filter((row) => row.time >= bucketStartSec);
+      console.log("[candle] history → chart split", {
+        source: "history-table",
+        interval: resolution,
+        sourceInterval: aggregateCfg?.source ?? resolution,
+        totalFromDb: rows.length,
+        completedToChart: completed.length,
+        droppedFormingBucket: droppedForming.length,
+        formingBucketStart: new Date(bucketStart).toISOString(),
+        note: "Dropped rows belong to the forming bucket — rebuilt via stored finer bars + realtime",
+      });
+      logCandleRows("[candle] history → chart (completed rows)", completed, {
+        source: "history-table",
+        interval: resolution,
+        role: "setHistory",
+      }, resolution);
+      if (droppedForming.length > 0) {
+        logCandleRows("[candle] history → dropped (forming bucket rows)", droppedForming, {
+          source: "history-table",
+          interval: resolution,
+          role: "excluded-from-setHistory",
+        }, resolution);
+      }
 
       if (token !== tokenRef.current) return null;
       handleRef.current?.setHistory(completed, { fit });
       return completed;
     };
 
-    const refetchFiner = async () => {
+    const refetchFiner = async (reason: string) => {
       const callSeq = ++finerFetchSeq;
       const now = Date.now();
       const bucket = bucketStartMs(now, bucketMs);
       formingBucketStartRef.current = bucket;
+      console.log("[candle] refetchFiner called", {
+        reason,
+        callSeq,
+        interval: resolution,
+        marketId,
+        bucketStart: new Date(bucket).toISOString(),
+        ladder,
+        whyMultipleCalls:
+          "initial=after history load; bucket-roll=new bucket from WS tick; periodic=every 15s; resync=after reconnect",
+      });
 
       if (ladder.length === 0) {
         finerRowsRef.current = {};
-        if (token === tokenRef.current) paintForming();
+        console.log("[candle] refetchFiner skipped DB — no finer ladder for interval", {
+          reason,
+          callSeq,
+          interval: resolution,
+        });
+        if (token === tokenRef.current) paintForming(true);
         return;
       }
 
@@ -255,18 +334,47 @@ export function RealtimeOhlcvChart({
         const byInterval: Partial<Record<CandleResolution, NormalizedCandle[]>> = {};
         await Promise.all(
           ladder.map(async (rung) => {
-            let rows = await fetchCandles(marketId, rung);
+            let rows = await fetchCandles(marketId, rung, { fromMs: bucket, toMs: now }, outcomeIndex);
             rows = mapOutcome(rows, binary, selectedOutcome);
             const bucketSec = Math.floor(bucket / 1000);
             const nowSec = Math.floor(now / 1000);
-            byInterval[rung] = rows.filter((r) => r.time >= bucketSec && r.time < nowSec);
+            byInterval[rung] = rows.filter((r) => r.time >= bucketSec && r.time <= nowSec);
           })
         );
         if (token !== tokenRef.current || callSeq !== finerFetchSeq) return;
         finerRowsRef.current = byInterval;
-        paintForming();
+        const liveTail = aggregatorRef.current?.current ?? null;
+        console.log("[candle] refetchFiner done — forming candle inputs", {
+          reason,
+          callSeq,
+          interval: resolution,
+          bucketStart: new Date(bucket).toISOString(),
+        });
+        logCandleRowsByInterval("[candle] refetchFiner — history-table rows", byInterval, {
+          source: "history-table",
+          reason,
+          callSeq,
+        });
+        if (liveTail) {
+          console.log("[candle] refetchFiner — realtime live tail", {
+            source: "realtime-ws",
+            reason,
+            callSeq,
+            row: formatCandleRowForLog(liveTail, resolution),
+          });
+          console.table([formatCandleRowForLog(liveTail, resolution)]);
+        } else {
+          console.log("[candle] refetchFiner — realtime live tail", {
+            source: "realtime-ws",
+            reason,
+            callSeq,
+            row: null,
+            note: "No websocket ticks ingested yet for this bucket",
+          });
+        }
+        paintForming(true);
       } catch (err) {
-        console.warn("[RealtimeOhlcvChart] finer refetch failed:", err);
+        console.error("[candle] refetchFiner failed:", { reason, callSeq, err });
       }
     };
 
@@ -274,7 +382,7 @@ export function RealtimeOhlcvChart({
       const price = outcomePrice(
         usePriceStore.getState().prices[marketId],
         selectedOutcome,
-        fallbackPrices
+        fallbackPricesRef.current
       );
       if (price == null) return;
       const tsMs = Date.now();
@@ -290,7 +398,7 @@ export function RealtimeOhlcvChart({
           if (rows == null) return;
           historyReadyRef.current = true;
           setStatus(rows.length ? "ready" : "empty");
-          void refetchFiner();
+          void refetchFiner("initial");
           seedFromLive();
         })
         .catch((err) => {
@@ -314,7 +422,7 @@ export function RealtimeOhlcvChart({
         if (rows == null || token !== tokenRef.current) return;
         historyReadyRef.current = true;
         setStatus(rows.length ? "ready" : "empty");
-        await refetchFiner();
+        await refetchFiner("resync");
         seedFromLive();
       } catch (err) {
         console.error("[RealtimeOhlcvChart] resync failed:", err);
@@ -331,7 +439,7 @@ export function RealtimeOhlcvChart({
       const next = state.prices[marketId];
       const before = prev.prices[marketId];
       if (next === before) return;
-      const price = outcomePrice(next, selectedOutcome, fallbackPrices);
+      const price = outcomePrice(next, selectedOutcome, fallbackPricesRef.current);
       if (price == null) return;
       const aggregator = aggregatorRef.current;
       if (!aggregator) return;
@@ -342,15 +450,35 @@ export function RealtimeOhlcvChart({
       const result = aggregator.ingest({ ...event, id: ++tickSeq });
       if (!result) return;
 
-      // Freeze the just-closed bucket on the chart before composing the new one.
-      if (result.sealed) {
-        handleRef.current?.updateLive(result.sealed);
-      }
+      console.log("[candle] realtime tick ingested", {
+        source: "realtime-ws",
+        interval: resolution,
+        event: {
+          id: event.id,
+          ts: new Date(event.tsMs).toISOString(),
+          o: event.open,
+          h: event.high,
+          l: event.low,
+          c: event.close,
+          v: event.volume,
+        },
+        aggregatorLive: result.live ? formatCandleRowForLog(result.live, resolution) : null,
+      });
 
+      // Boundary crossed: keep the last composed bar frozen. Refetch finer
+      // blocks for the new bucket and recompose from scratch.
       const eventBucket = bucketStartMs(event.tsMs, bucketMs);
       if (eventBucket !== formingBucketStartRef.current) {
-        // Boundary crossed: recompose new bucket from finer DB + live tail.
-        void refetchFiner();
+        console.log("[candle] bucket roll → will refetchFiner", {
+          source: "realtime-ws",
+          interval: resolution,
+          prevBucket:
+            formingBucketStartRef.current != null
+              ? new Date(formingBucketStartRef.current).toISOString()
+              : null,
+          newBucket: new Date(eventBucket).toISOString(),
+        });
+        void refetchFiner("bucket-roll");
       } else {
         scheduleFlush();
       }
@@ -363,10 +491,9 @@ export function RealtimeOhlcvChart({
     });
 
     // Periodic finer pull so newly-closed blocks fold in (quiet markets too).
-    const finerTimer = window.setInterval(() => void refetchFiner(), FINER_REFETCH_MS);
+    const finerTimer = window.setInterval(() => void refetchFiner("periodic"), FINER_REFETCH_MS);
 
     return () => {
-      cancelAnimationFrame(loadingId);
       unsubStore();
       unsubReconnect();
       window.clearInterval(finerTimer);
@@ -377,7 +504,6 @@ export function RealtimeOhlcvChart({
     };
   }, [
     binary,
-    fallbackPrices,
     marketId,
     paintForming,
     resolution,
