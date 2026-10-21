@@ -4,6 +4,7 @@ import { supabaseAdmin } from '../lib/supabase.js';
 import { broadcastPriceUpdate } from '../routes/websocket.js';
 import { buildKalshiWsAuthHeaders, KALSHI_WS_URL } from '../lib/kalshiClient.js';
 import { candleAggregator } from '../services/candleAggregator.js';
+import { pricesNeedPersist } from '../lib/pricePersist.js';
 import {
   countRecentTicks,
   formatPriceStreamCoverage,
@@ -38,6 +39,8 @@ const RECONNECT_BASE_MS = 5000;
 
 const updateQueue = new Map<string, PriceUpdate>();
 const marketPrices = new Map<string, number[]>();
+/** Last prices successfully written to markets. Unchanged ticks stay on the socket only. */
+const lastPersistedPrices = new Map<string, number[]>();
 /** Last live tick wall-clock per canonical_id (coverage metrics). */
 const lastTickAtByMarket = new Map<string, number>();
 /** Fair-rotate cursors (in-memory; reset on process restart). */
@@ -201,7 +204,7 @@ async function loadWatchlistIdsForPlatform(
 async function countActiveMarkets(platform: 'polymarket' | 'kalshi'): Promise<number | null> {
   const { count, error } = await supabaseAdmin
     .from('markets')
-    .select('*', { count: 'exact', head: true })
+    .select('canonical_id', { count: 'estimated', head: true })
     .eq('platform', platform)
     .eq('active', true);
   if (error) return null;
@@ -212,34 +215,21 @@ async function loadStreamMarketPools(
   platform: 'polymarket' | 'kalshi',
   pageSize: number
 ): Promise<{ highVolume: StreamMarketRow[]; rotatePool: StreamMarketRow[] }> {
-  const volumeLimit = Math.max(pageSize, Math.min(pageSize * 2, 300));
   const rotateLimit = Math.max(pageSize, Math.min(pageSize * 4, 600));
 
+  // Order by the primary key. ORDER BY volume scans and sorts the whole
+  // catalogue and was cancelled by the database statement timeout.
   const selectCols =
-    platform === 'polymarket'
-      ? 'canonical_id, platform, external_id, volume, active, updated_at, prices, raw_data'
-      : 'canonical_id, platform, external_id, volume, active, updated_at, prices';
+    'canonical_id, platform, external_id, volume, active, updated_at, prices';
 
-  const [volRes, rotRes] = await Promise.all([
-    supabaseAdmin
-      .from('markets')
-      .select(selectCols)
-      .eq('platform', platform)
-      .eq('active', true)
-      .order('volume', { ascending: false })
-      .limit(volumeLimit),
-    supabaseAdmin
-      .from('markets')
-      .select(selectCols)
-      .eq('platform', platform)
-      .eq('active', true)
-      .order('canonical_id', { ascending: true })
-      .limit(rotateLimit),
-  ]);
+  const rotRes = await supabaseAdmin
+    .from('markets')
+    .select(selectCols)
+    .eq('platform', platform)
+    .eq('active', true)
+    .order('canonical_id', { ascending: true })
+    .limit(rotateLimit);
 
-  if (volRes.error) {
-    console.error(`[Price Stream][${platform}] volume pool:`, volRes.error.message);
-  }
   if (rotRes.error) {
     console.error(`[Price Stream][${platform}] rotate pool:`, rotRes.error.message);
   }
@@ -253,14 +243,42 @@ async function loadStreamMarketPools(
     updated_at: m.updated_at != null ? String(m.updated_at) : null,
     meta: {
       prices: m.prices,
-      raw_data: m.raw_data ?? null,
     },
   });
 
-  return {
-    highVolume: (volRes.data ?? []).map(toRow),
-    rotatePool: (rotRes.data ?? []).map(toRow),
-  };
+  const rotatePool = (rotRes.data ?? []).map(toRow);
+  const highVolume = [...rotatePool].sort(
+    (a, b) => Number(b.volume ?? 0) - Number(a.volume ?? 0)
+  );
+  return { highVolume, rotatePool };
+}
+
+/** CLOB token ids for the markets actually subscribed, not the whole candidate pool. */
+async function loadPolymarketClobTokens(
+  ids: string[]
+): Promise<Map<string, Record<string, unknown>>> {
+  const out = new Map<string, Record<string, unknown>>();
+  const unique = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
+  for (const chunk of chunkArray(unique, 50)) {
+    const { data, error } = await supabaseAdmin
+      .from('markets')
+      .select('canonical_id, clob_token_ids:raw_data->clobTokenIds, tokens:raw_data->tokens')
+      .in('canonical_id', chunk);
+    if (error) {
+      console.warn(
+        '[Price Stream][polymarket] token lookup:',
+        error.message.slice(0, 160)
+      );
+      continue;
+    }
+    for (const row of data ?? []) {
+      out.set(String(row.canonical_id), {
+        clobTokenIds: row.clob_token_ids,
+        tokens: row.tokens,
+      });
+    }
+  }
+  return out;
 }
 
 /**
@@ -290,8 +308,12 @@ async function loadActivePolymarketMarkets(): Promise<string[]> {
     tokenToCanonicalMap.delete(key);
   }
 
+  const tokenRaw = await loadPolymarketClobTokens(
+    selection.markets.map((market) => market.canonical_id)
+  );
+
   for (const market of selection.markets) {
-    const raw = (market.meta?.raw_data as Record<string, unknown> | null) ?? {};
+    const raw = tokenRaw.get(market.canonical_id) ?? {};
     const prices = market.meta?.prices;
     const canonicalId = market.canonical_id;
     const isMulti = canonicalId.includes('_event_');
@@ -844,8 +866,11 @@ async function flushPriceUpdates(): Promise<void> {
 
   // Secondary: persist in small concurrent batches (avoids Cloudflare 520 from burst updates)
   const CONCURRENCY = 8;
-  for (let i = 0; i < updates.length; i += CONCURRENCY) {
-    const slice = updates.slice(i, i + CONCURRENCY);
+  const toWrite = updates.filter((update) =>
+    pricesNeedPersist(lastPersistedPrices.get(update.canonicalId), update.prices)
+  );
+  for (let i = 0; i < toWrite.length; i += CONCURRENCY) {
+    const slice = toWrite.slice(i, i + CONCURRENCY);
     const results = await Promise.all(
       slice.map(async (update) => {
         const { error } = await supabaseAdmin
@@ -855,6 +880,7 @@ async function flushPriceUpdates(): Promise<void> {
             updated_at: timestamp,
           })
           .eq('canonical_id', update.canonicalId);
+        if (!error) lastPersistedPrices.set(update.canonicalId, [...update.prices]);
         return error;
       })
     );

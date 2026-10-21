@@ -8,8 +8,11 @@ import {
   buildKalshiOrderbookRow,
   buildPolymarketOrderbookRow,
   extractPolymarketTokenIds,
+  isPolymarketMissingBook,
   LatestWinsPersistQueue,
   orderbookLadderFingerprint,
+  polymarketBookDisabled,
+  polymarketConditionId,
   resolvePolymarketOrderbookMarketId,
   writeLatestSnapshot,
   type KalshiOrderbookRow,
@@ -18,6 +21,8 @@ import {
 
 /** Short in-memory cache — reduces venue load while FE polls (~5s). */
 const ORDERBOOK_CACHE_TTL_MS = 2_500;
+/** A closed market has no live book. Keep the empty result so polls do not re-hit CLOB. */
+const CLOSED_BOOK_CACHE_MS = 60_000;
 
 type CachedOrderbook = {
   expiresAt: number;
@@ -65,11 +70,62 @@ class OrderbookStore {
     }
 
     const value = await this.fetchLiveOrderbook(canonicalId);
+    const closed = (value as { closed?: boolean }).closed === true;
     this.cache.set(canonicalId, {
-      expiresAt: Date.now() + ORDERBOOK_CACHE_TTL_MS,
+      expiresAt: Date.now() + (closed ? CLOSED_BOOK_CACHE_MS : ORDERBOOK_CACHE_TTL_MS),
       value,
     });
     return value;
+  }
+
+  /**
+   * Polymarket removes the book after a market closes. That 404 is an empty
+   * ladder. A 404 on a market that still has its book enabled stays an error,
+   * so a stale token is not replaced with made-up prices.
+   */
+  private async emptyBookIfPolymarketClosed(
+    canonicalId: string,
+    raw: Record<string, unknown>,
+    bookResponse: Response
+  ): Promise<Record<string, unknown> | null> {
+    let body: unknown = null;
+    try {
+      body = await bookResponse.json();
+    } catch {
+      return null;
+    }
+    if (!isPolymarketMissingBook(bookResponse.status, body)) return null;
+
+    const conditionId = polymarketConditionId(canonicalId, raw);
+    if (!conditionId) return null;
+
+    try {
+      const metaRes = await fetch(
+        `https://clob.polymarket.com/markets/${encodeURIComponent(conditionId)}`,
+        {
+          headers: { Accept: 'application/json' },
+          signal: AbortSignal.timeout(8_000),
+        }
+      );
+      if (!metaRes.ok) return null;
+      const meta = (await metaRes.json()) as {
+        closed?: unknown;
+        enable_order_book?: unknown;
+      };
+      if (!polymarketBookDisabled(meta)) return null;
+    } catch {
+      return null;
+    }
+
+    return {
+      canonical_id: canonicalId,
+      platform: 'polymarket',
+      bids: [],
+      asks: [],
+      timestamp: new Date().toISOString(),
+      cached: false,
+      closed: true,
+    };
   }
 
   private async fetchLiveOrderbook(canonicalId: string) {
@@ -97,12 +153,14 @@ class OrderbookStore {
 
       const res = await fetch(
         `https://clob.polymarket.com/book?token_id=${encodeURIComponent(String(tokenId))}`,
-        { headers: { Accept: 'application/json' } }
+        {
+          headers: { Accept: 'application/json' },
+          signal: AbortSignal.timeout(15_000),
+        }
       );
       if (!res.ok) {
-        // Venue failure — do not treat as empty book or wipe stored snapshot.
-        // 404 is ambiguous: stale token in markets.raw_data, closed/delisted
-        // market, CLOB gap, or never-listed token — do not invent replacements.
+        const closedBook = await this.emptyBookIfPolymarketClosed(canonicalId, raw, res);
+        if (closedBook) return closedBook;
         throw new Error(`Polymarket CLOB error: ${res.status}`);
       }
 

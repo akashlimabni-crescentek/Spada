@@ -295,7 +295,7 @@ async function attachKalshiEventVolumes(
     for (const tickerChunk of chunkArray(eventTickers, 30)) {
       const { data, error } = await supabaseAdmin
         .from('markets')
-        .select('canonical_id, volume, raw_data')
+        .select('canonical_id, volume, event_ticker:raw_data->>event_ticker')
         .eq('platform', 'kalshi')
         .eq('active', true)
         .filter('raw_data->>event_ticker', 'in', `(${tickerChunk.join(',')})`);
@@ -309,7 +309,7 @@ async function attachKalshiEventVolumes(
       }
 
       for (const row of data ?? []) {
-        const et = row.raw_data?.event_ticker;
+        const et = row.event_ticker;
         if (typeof et !== 'string' || !et) continue;
         if (batchIdsByEvent.get(et)?.has(row.canonical_id)) continue;
         const siblingVol = Number(row.volume || 0);

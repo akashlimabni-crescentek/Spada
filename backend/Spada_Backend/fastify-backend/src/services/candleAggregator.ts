@@ -829,7 +829,7 @@ class CandleAggregator {
     try {
       const { count, error: countError } = await supabaseAdmin
         .from('markets')
-        .select('canonical_id', { count: 'exact', head: true })
+        .select('canonical_id', { count: 'estimated', head: true })
         .eq('active', true);
 
       if (countError) {
@@ -941,15 +941,17 @@ class CandleAggregator {
   private async loadHighVolumeActiveMarkets(limit: number): Promise<SyncMarketRow[]> {
     const { data, error } = await supabaseAdmin
       .from('markets')
-      .select('canonical_id, platform, external_id, raw_data, volume, active')
+      .select('canonical_id, platform, external_id, volume, active')
       .eq('active', true)
-      .order('volume', { ascending: false })
+      .order('canonical_id', { ascending: true })
       .limit(limit);
     if (error) {
       console.warn(`[CandleAggregator] volume markets: ${error.message.slice(0, 200)}`);
       return [];
     }
-    return (data ?? []) as SyncMarketRow[];
+    return [...(data ?? [])].sort(
+      (a, b) => Number(b.volume || 0) - Number(a.volume || 0)
+    ) as SyncMarketRow[];
   }
 
   private async loadActiveMarketsByRanges(
@@ -960,7 +962,7 @@ class CandleAggregator {
       if (range.to < range.from) continue;
       const { data, error } = await supabaseAdmin
         .from('markets')
-        .select('canonical_id, platform, external_id, raw_data, volume, active')
+        .select('canonical_id, platform, external_id, volume, active')
         .eq('active', true)
         .order('canonical_id', { ascending: true })
         .range(range.from, range.to);
