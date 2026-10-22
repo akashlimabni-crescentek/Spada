@@ -1,11 +1,18 @@
-import { useQuery } from "@tanstack/react-query";
+"use client";
+
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { getApiBaseUrl } from "@/lib/apiBase";
+import { usePriceStore } from "@/stores/usePriceStore";
 import type { MarketCross } from "@/types/ratios";
 
 export function useRatios(marketId: string | null) {
+  const liveYes = usePriceStore((state) =>
+    marketId ? state.prices[marketId]?.[0] : undefined
+  );
+
   return useQuery({
-    queryKey: ["ratios", marketId],
+    queryKey: ["ratios", marketId, liveYes ?? "none"],
     queryFn: async (): Promise<MarketCross> => {
       const base = getApiBaseUrl();
       if (!base) throw new Error("NEXT_PUBLIC_API_URL is not set");
@@ -14,5 +21,8 @@ export function useRatios(marketId: string | null) {
       return res.json();
     },
     enabled: !!marketId,
+    placeholderData: keepPreviousData,
+    // Book-driven fields (execution cost, Kalshi liquidity) change without a new price tick.
+    refetchInterval: 5_000,
   });
 }

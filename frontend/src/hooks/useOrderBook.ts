@@ -21,13 +21,24 @@ export interface OrderBookResponse {
 type KalshiTuple = [string | number, string | number];
 
 function parseKalshiTuple(level: unknown): { price: number; size: number } | null {
-  if (!Array.isArray(level) || level.length < 2) return null;
-  const price = Number(level[0]);
-  const size = Number(level[1]);
-  if (!Number.isFinite(price) || !Number.isFinite(size) || price < 0 || size < 0) {
-    return null;
+  if (Array.isArray(level) && level.length >= 2) {
+    const price = Number(level[0]);
+    const size = Number(level[1]);
+    if (!Number.isFinite(price) || !Number.isFinite(size) || price < 0 || size <= 0) {
+      return null;
+    }
+    return { price, size };
   }
-  return { price, size };
+  if (level && typeof level === "object") {
+    const row = level as Record<string, unknown>;
+    const price = Number(row.price);
+    const size = Number(row.size ?? row.qty ?? row.quantity);
+    if (!Number.isFinite(price) || !Number.isFinite(size) || price < 0 || size <= 0) {
+      return null;
+    }
+    return { price, size };
+  }
+  return null;
 }
 
 function asLevelArray(raw: unknown): KalshiTuple[] {
@@ -51,20 +62,41 @@ function normalizeKalshiOrderbook(raw: {
     book.no_dollars ?? book.no ?? book.no_bids ?? (book as { noBids?: unknown }).noBids
   );
 
-  const bids: OrderLevel[] = [];
-  for (const level of yesLevels) {
-    const parsed = parseKalshiTuple(level);
-    if (parsed) bids.push(parsed);
-  }
+  const yesParsed = yesLevels
+    .map(parseKalshiTuple)
+    .filter((level): level is { price: number; size: number } => level != null)
+    .sort((a, b) => b.price - a.price);
+  const noParsed = noLevels
+    .map(parseKalshiTuple)
+    .filter((level): level is { price: number; size: number } => level != null)
+    .sort((a, b) => b.price - a.price);
+
+  const bestYes = yesParsed[0]?.price;
+  const bestNo = noParsed[0]?.price;
+  const crossed =
+    bestYes != null && bestNo != null && bestYes + bestNo > 1.0001;
+  const noLeg = crossed
+    ? noParsed
+        .map((level) => ({
+          price: Math.round((1 - level.price) * 1e6) / 1e6,
+          size: level.size,
+        }))
+        .filter((level) => level.price > 0 && level.price < 1)
+        .sort((a, b) => b.price - a.price)
+    : noParsed;
+
+  const bids: OrderLevel[] = yesParsed.map((level) => ({
+    price: level.price,
+    size: level.size,
+  }));
 
   const asks: OrderLevel[] = [];
-  for (const level of noLevels) {
-    const parsed = parseKalshiTuple(level);
-    if (!parsed) continue;
-    const yesAsk = Number((1 - parsed.price).toFixed(6));
+  for (const level of noLeg) {
+    const yesAsk = Number((1 - level.price).toFixed(6));
     if (!Number.isFinite(yesAsk) || yesAsk < 0) continue;
-    asks.push({ price: yesAsk, size: parsed.size });
+    asks.push({ price: yesAsk, size: level.size });
   }
+  asks.sort((a, b) => Number(a.price) - Number(b.price));
 
   return { bids, asks };
 }
