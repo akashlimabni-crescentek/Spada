@@ -79,6 +79,35 @@ export class CandleAggregator {
     this.midCount = 0;
   }
 
+  /**
+   * Open the current candle from a stored bar for this bucket.
+   * Later ticks still fold in: open stays, high/low/close/volume move.
+   * lastEventId is cleared so the next live tick is not treated as a replay.
+   */
+  seed(row: NormalizedCandle): void {
+    if (!Number.isFinite(row.time)) return;
+    const open = row.open;
+    const high = row.high;
+    const low = row.low;
+    const close = row.close;
+    if (![open, high, low, close].every((value) => Number.isFinite(value))) return;
+
+    this.liveBucketStart = row.time * 1000;
+    this.lastEventId = Number.NEGATIVE_INFINITY;
+    const mid = Number.isFinite(close) ? close : null;
+    this.midSum = mid ?? 0;
+    this.midCount = mid == null ? 0 : 1;
+    this.live = {
+      time: Math.floor(row.time),
+      open,
+      high,
+      low,
+      close,
+      volume: Number.isFinite(row.volume) ? row.volume : 0,
+      mid,
+    };
+  }
+
   ingest(event: CandleEvent): IngestResult | null {
     // 1. Dedupe / replay guard
     if (event.id <= this.lastEventId) return null;

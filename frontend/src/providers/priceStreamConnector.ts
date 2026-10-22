@@ -191,7 +191,11 @@ export function PriceStreamConnector() {
                   receivedAt: new Date().toISOString(),
                 });
               }
-              setPrice(msg.canonical_id, msg.prices);
+              setPrice(
+                msg.canonical_id,
+                msg.prices,
+                typeof msg.timestamp === "string" ? msg.timestamp : undefined
+              );
             }
           } catch {
             // ignore malformed frames

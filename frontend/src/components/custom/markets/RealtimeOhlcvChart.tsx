@@ -28,7 +28,6 @@ import {
   stripFormingBucket,
 } from "@/lib/candles/formingCandle";
 import { getApiBaseUrl } from "@/lib/apiBase";
-import { invertCandles } from "@/lib/candles/lineRange";
 import { normalizeCandles } from "@/lib/candles/normalize";
 import type { CandleResolution, NormalizedCandle } from "@/lib/candles/types";
 import type { OhlcvChartHandle } from "@/lib/charts/ohlcvChart";
@@ -37,6 +36,18 @@ import { usePriceStore } from "@/stores/usePriceStore";
 
 /** How often to refetch finer sub-candles so newly-closed blocks fold in. */
 const FINER_REFETCH_MS = 15_000;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Same lookbacks as the POC `OHLCV_SOURCE`. */
+const OHLCV_LOOKBACK_MS: Record<CandleResolution, number> = {
+  "5m": 30 * DAY_MS,
+  "15m": 30 * DAY_MS,
+  "1h": 90 * DAY_MS,
+  "4h": 90 * DAY_MS,
+  "1d": 365 * DAY_MS,
+  "1w": 365 * DAY_MS,
+};
 
 /**
  * When set, history for this resolution is loaded from a finer source interval
@@ -55,26 +66,30 @@ type Status = "loading" | "ready" | "empty" | "error";
 type RealtimeOhlcvChartProps = {
   marketId: string;
   resolution: CandleResolution;
-  /** 0 = Yes / primary, 1 = No (binary invert). */
+  /** Outcome index. History is that outcome's stored candles. */
   selectedOutcome: number;
   binary: boolean;
   height: number;
-  fallbackPrices: number[];
 };
+
+function ohlcvWindow(resolution: CandleResolution): { fromMs: number; toMs: number } {
+  const toMs = Date.now();
+  return { fromMs: toMs - OHLCV_LOOKBACK_MS[resolution], toMs };
+}
 
 async function fetchCandles(
   marketId: string,
   resolution: CandleResolution,
-  window?: { fromMs: number; toMs: number },
+  window: { fromMs: number; toMs: number },
   outcomeIndex = 0
 ): Promise<NormalizedCandle[]> {
   const base = getApiBaseUrl();
-  const params = new URLSearchParams({ resolution });
-  if (window) {
-    params.set("from", new Date(window.fromMs).toISOString());
-    params.set("to", new Date(window.toMs).toISOString());
-  }
-  // Binary No stays 1 − Yes. Other outcomes have their own token history.
+  const params = new URLSearchParams({
+    resolution,
+    stored: "1",
+    from: new Date(window.fromMs).toISOString(),
+    to: new Date(window.toMs).toISOString(),
+  });
   if (outcomeIndex > 0) params.set("outcome", String(outcomeIndex));
   const url = `${base}/api/v1/markets/${encodeURIComponent(marketId)}/candles?${params.toString()}`;
   const res = await fetch(url);
@@ -82,22 +97,8 @@ async function fetchCandles(
   return normalizeCandles(await res.json());
 }
 
-function mapOutcome(
-  rows: NormalizedCandle[],
-  binary: boolean,
-  selectedOutcome: number
-): NormalizedCandle[] {
-  if (binary && selectedOutcome === 1) return invertCandles(rows);
-  return rows;
-}
-
-function outcomePrice(
-  prices: number[] | undefined,
-  selectedOutcome: number,
-  fallback: number[]
-): number | null {
-  const list = prices?.length ? prices : fallback;
-  const value = list[selectedOutcome];
+function outcomePrice(prices: number[] | undefined, selectedOutcome: number): number | null {
+  const value = prices?.[selectedOutcome];
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
@@ -107,13 +108,9 @@ export function RealtimeOhlcvChart({
   selectedOutcome,
   binary,
   height,
-  fallbackPrices,
 }: RealtimeOhlcvChartProps) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-
-  const fallbackPricesRef = useRef(fallbackPrices);
-  fallbackPricesRef.current = fallbackPrices;
 
   const handleRef = useRef<OhlcvChartHandle | null>(null);
   const chartReadyRef = useRef<Promise<OhlcvChartHandle | null>>(Promise.resolve(null));
@@ -214,7 +211,7 @@ export function RealtimeOhlcvChart({
   useEffect(() => {
     const token = ++tokenRef.current;
     historyReadyRef.current = false;
-    const outcomeIndex = !binary && selectedOutcome > 0 ? selectedOutcome : 0;
+    const outcomeIndex = selectedOutcome > 0 ? selectedOutcome : 0;
     setStatus("loading");
 
     const bucketMs = RESOLUTION_MS[resolution];
@@ -231,7 +228,6 @@ export function RealtimeOhlcvChart({
     finerRowsRef.current = {};
     formingBucketStartRef.current = null;
     let finerFetchSeq = 0;
-    let tickSeq = 0;
 
     console.log("[candle] chart session start", {
       marketId,
@@ -250,10 +246,9 @@ export function RealtimeOhlcvChart({
       let rows = await fetchCandles(
         marketId,
         aggregateCfg?.source ?? resolution,
-        undefined,
+        ohlcvWindow(aggregateCfg?.source ?? resolution),
         outcomeIndex
       );
-      rows = mapOutcome(rows, binary, selectedOutcome);
       if (aggregateCfg) {
         console.log("[candle] history aggregate", {
           source: "history-table",
@@ -334,8 +329,12 @@ export function RealtimeOhlcvChart({
         const byInterval: Partial<Record<CandleResolution, NormalizedCandle[]>> = {};
         await Promise.all(
           ladder.map(async (rung) => {
-            let rows = await fetchCandles(marketId, rung, { fromMs: bucket, toMs: now }, outcomeIndex);
-            rows = mapOutcome(rows, binary, selectedOutcome);
+            const rows = await fetchCandles(
+              marketId,
+              rung,
+              { fromMs: bucket, toMs: now },
+              outcomeIndex
+            );
             const bucketSec = Math.floor(bucket / 1000);
             const nowSec = Math.floor(now / 1000);
             byInterval[rung] = rows.filter((r) => r.time >= bucketSec && r.time <= nowSec);
@@ -378,20 +377,6 @@ export function RealtimeOhlcvChart({
       }
     };
 
-    const seedFromLive = () => {
-      const price = outcomePrice(
-        usePriceStore.getState().prices[marketId],
-        selectedOutcome,
-        fallbackPricesRef.current
-      );
-      if (price == null) return;
-      const tsMs = Date.now();
-      const event = priceToEvent(price, tsMs);
-      if (!event) return;
-      aggregatorRef.current?.ingest({ ...event, id: ++tickSeq });
-      paintForming();
-    };
-
     const applyHistory = (fit: boolean) => {
       return loadHistory(fit)
         .then((rows) => {
@@ -399,7 +384,6 @@ export function RealtimeOhlcvChart({
           historyReadyRef.current = true;
           setStatus(rows.length ? "ready" : "empty");
           void refetchFiner("initial");
-          seedFromLive();
         })
         .catch((err) => {
           if (token !== tokenRef.current) return;
@@ -417,13 +401,11 @@ export function RealtimeOhlcvChart({
       resyncingRef.current = true;
       try {
         aggregatorRef.current?.reset();
-        tickSeq = 0;
         const rows = await loadHistory(false);
         if (rows == null || token !== tokenRef.current) return;
         historyReadyRef.current = true;
         setStatus(rows.length ? "ready" : "empty");
         await refetchFiner("resync");
-        seedFromLive();
       } catch (err) {
         console.error("[RealtimeOhlcvChart] resync failed:", err);
       } finally {
@@ -433,21 +415,23 @@ export function RealtimeOhlcvChart({
 
     void applyHistory(true);
 
-    // Websocket price ticks → live aggregator.
+    // Websocket price ticks → live aggregator. Time is the socket timestamp,
+    // the same role as the POC updated_at. A missing timestamp does not move the candle.
     const unsubStore = usePriceStore.subscribe((state, prev) => {
       if (token !== tokenRef.current) return;
       const next = state.prices[marketId];
-      const before = prev.prices[marketId];
-      if (next === before) return;
-      const price = outcomePrice(next, selectedOutcome, fallbackPricesRef.current);
-      if (price == null) return;
+      const at = state.quotedAt[marketId];
+      if (next === prev.prices[marketId] && at === prev.quotedAt[marketId]) return;
+      const price = outcomePrice(next, selectedOutcome);
+      if (price == null || !at) return;
+      const tsMs = Date.parse(at);
+      if (!Number.isFinite(tsMs)) return;
       const aggregator = aggregatorRef.current;
       if (!aggregator) return;
 
-      const tsMs = Date.now();
       const event = priceToEvent(price, tsMs);
       if (!event) return;
-      const result = aggregator.ingest({ ...event, id: ++tickSeq });
+      const result = aggregator.ingest(event);
       if (!result) return;
 
       console.log("[candle] realtime tick ingested", {
@@ -512,25 +496,19 @@ export function RealtimeOhlcvChart({
   ]);
 
   return (
-    <div ref={wrapperRef} className="ohlcv-chart relative">
+    <div ref={wrapperRef} className="chart-wrap">
       {status === "loading" ? (
-        <div className="pointer-events-none absolute inset-x-0 top-2 z-10 text-center text-xs text-text-dim">
-          Loading chart…
-        </div>
+        <div className="status-banner status-banner-info">Loading chart…</div>
       ) : null}
       {status === "error" ? (
-        <div className="pointer-events-none absolute inset-x-0 top-2 z-10 text-center text-xs text-negative">
-          Failed to load chart data
-        </div>
+        <div className="status-banner status-banner-warn">Failed to load chart data</div>
       ) : null}
       {status === "empty" ? (
-        <div className="pointer-events-none absolute inset-x-0 top-2 z-10 text-center text-xs text-text-dim">
-          {!binary && selectedOutcome > 0
-            ? "No candles for this outcome"
-            : `No ${resolution} candles`}
+        <div className="status-banner status-banner-warn">
+          No OHLCV data yet — promote this event to hot and wait for history backfill.
         </div>
       ) : null}
-      <div ref={containerRef} style={{ height, minHeight: height }} />
+      <div ref={containerRef} className="chart-shell" style={{ height, minHeight: height }} />
     </div>
   );
 }

@@ -4,6 +4,7 @@ import {
   createChart,
   type CandlestickData,
   type HistogramData,
+  type IChartApi,
   type ISeriesApi,
   type LineData,
   type MouseEventParams,
@@ -104,20 +105,24 @@ function timeToSeconds(time: Time): number | null {
   return null;
 }
 
-function formatAxis(ms: number): string {
+function formatAxis(ms: number, withSeconds = false): string {
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: "UTC",
     day: "2-digit",
     month: "short",
     hour: "2-digit",
     minute: "2-digit",
+    second: withSeconds ? "2-digit" : undefined,
     hour12: false,
   }).formatToParts(new Date(ms));
 
   const pick = (type: Intl.DateTimeFormatPartTypes) =>
     parts.find((part) => part.type === type)?.value ?? "";
 
-  return `${pick("day")} ${pick("month")} ${pick("hour")}:${pick("minute")}`;
+  const clock = withSeconds
+    ? `${pick("hour")}:${pick("minute")}:${pick("second")}`
+    : `${pick("hour")}:${pick("minute")}`;
+  return `${pick("day")} ${pick("month")} ${clock}`;
 }
 
 function formatScalePrice(price: number, probability: boolean): string {
@@ -129,7 +134,7 @@ function formatScalePrice(price: number, probability: boolean): string {
 function formatVolume(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
   if (value >= 1_000) return `${(value / 1_000).toFixed(2)}K`;
-  return value.toFixed(0);
+  return value.toFixed(2);
 }
 
 function formatPrice(value: number, probability: boolean, digits: number): string {
@@ -198,6 +203,23 @@ function isLastPointUpdate(prev: ChartLinePoint[], next: ChartLinePoint[]): bool
     if (prev[i].time !== next[i].time || prev[i].value !== next[i].value) return false;
   }
   return prev[prev.length - 1].time === next[next.length - 1].time;
+}
+
+/**
+ * Put the newest bar on the right border.
+ * Mouse pan and wheel keep their zoom until the next socket tick, which snaps back here.
+ * The library applies a new bar on a later frame and can undo a same-turn scroll,
+ * so the pin is repeated after that frame.
+ */
+function pinLatestBar(chart: IChartApi, isAlive: () => boolean): void {
+  const pin = () => {
+    if (!isAlive()) return;
+    chart.timeScale().scrollToPosition(0, false);
+  };
+  pin();
+  requestAnimationFrame(() => {
+    requestAnimationFrame(pin);
+  });
 }
 
 function isAppendPoint(prev: ChartLinePoint[], next: ChartLinePoint[]): boolean {
@@ -277,6 +299,8 @@ export function createOhlcvChart(
       borderColor: theme.border,
       timeVisible: true,
       secondsVisible: false,
+      rightOffset: 0,
+      shiftVisibleRangeOnNewBar: true,
       tickMarkFormatter: (time: Time, tickMarkType: number) => {
         const seconds = timeToSeconds(time);
         if (seconds == null) return "";
@@ -343,6 +367,7 @@ export function createOhlcvChart(
   tooltip.setAttribute("role", "tooltip");
   wrapper.appendChild(tooltip);
 
+  let alive = true;
   let probability = true;
   const candleByTime = new Map<number, NormalizedCandle>();
   let lastChartCandles: ChartCandle[] = [];
@@ -455,7 +480,7 @@ export function createOhlcvChart(
       }
     },
 
-    // Fast lane — O(1) trailing candle patch; preserves zoom/pan.
+    // Fast lane — O(1) trailing candle patch. Each socket tick pins the open candle to the right edge.
     updateLive(row) {
       candleByTime.set(row.time, row);
       const [candle] = toChartCandles([row]);
@@ -476,12 +501,14 @@ export function createOhlcvChart(
       ) {
         lastChartCandles = [...lastChartCandles, candle];
       }
+      pinLatestBar(chart, () => alive);
     },
 
     resize(width, nextHeight) {
       chart.applyOptions({ width, height: nextHeight });
     },
     destroy() {
+      alive = false;
       chart.unsubscribeCrosshairMove(onCrosshair);
       tooltip.remove();
       chart.remove();
@@ -527,6 +554,8 @@ export function createLineChart(
       borderColor: theme.border,
       timeVisible: true,
       secondsVisible: false,
+      rightOffset: 0,
+      shiftVisibleRangeOnNewBar: true,
       tickMarkFormatter: (time: Time, tickMarkType: number) => {
         const seconds = timeToSeconds(time);
         if (seconds == null) return "";
@@ -648,7 +677,7 @@ export function createLineChart(
   };
 }
 
-/** Multi-outcome line chart. */
+/** Multi-outcome line chart. Live tips are one point per second, so the axis shows seconds. */
 export function createMultiLineChart(
   container: HTMLElement,
   height: number
@@ -678,12 +707,14 @@ export function createMultiLineChart(
     timeScale: {
       borderColor: theme.border,
       timeVisible: true,
-      secondsVisible: false,
+      secondsVisible: true,
+      rightOffset: 0,
+      shiftVisibleRangeOnNewBar: true,
       tickMarkFormatter: (time: Time, tickMarkType: number) => {
         const seconds = timeToSeconds(time);
         if (seconds == null) return "";
         if (tickMarkType <= 2) return formatGmt(seconds * 1000, false);
-        return formatAxis(seconds * 1000);
+        return formatAxis(seconds * 1000, tickMarkType >= 4);
       },
     },
     crosshair: {
@@ -716,15 +747,12 @@ export function createMultiLineChart(
 
   const seriesById = new Map<number, ISeriesApi<"Line">>();
   const pointsById = new Map<number, ChartLinePoint[]>();
+  let alive = true;
 
   return {
     setLines(lines, options = {}) {
       const fit = options.fit === true;
-      // Stay on the live edge the way a trading chart does. Restoring the old
-      // logical range after an append pushes the new point off-screen.
-      const followLive = !fit && chart.timeScale().scrollPosition() < 2;
-      const visibleRange =
-        fit || followLive ? null : chart.timeScale().getVisibleLogicalRange();
+      const scale = chart.timeScale();
       const nextIds = new Set(lines.map((line) => line.id));
 
       for (const [id, series] of seriesById) {
@@ -770,16 +798,18 @@ export function createMultiLineChart(
         pointsById.set(line.id, chartPoints);
       }
 
-      if (fit) {
-        chart.timeScale().fitContent();
-      } else if (visibleRange) {
-        chart.timeScale().setVisibleLogicalRange(visibleRange);
-      }
+      const hasPoints = lines.some((line) => line.points.length > 0);
+      // A fitted series hides new ticks: every point stays on screen, so the edge never moves.
+      // The first view uses a fixed bar width and sits on the newest point. Later ticks keep
+      // the mouse zoom and only pull that newest point back to the right border.
+      if (fit) scale.applyOptions({ barSpacing: 8, rightOffset: 0 });
+      if (hasPoints) pinLatestBar(chart, () => alive);
     },
     resize(width, nextHeight) {
       chart.applyOptions({ width, height: nextHeight });
     },
     destroy() {
+      alive = false;
       chart.remove();
     },
   };

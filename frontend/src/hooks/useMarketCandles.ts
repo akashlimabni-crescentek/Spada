@@ -4,14 +4,25 @@ import { useQuery } from "@tanstack/react-query";
 
 import { getApiBaseUrl } from "@/lib/apiBase";
 import { normalizeCandles } from "@/lib/candles/normalize";
+import type { LineResolution } from "@/lib/candles/lineRange";
 import type { CandleResolution, NormalizedCandle } from "@/lib/candles/types";
 
-async function fetchMarketCandles(
+export async function fetchMarketCandles(
   marketId: string,
-  resolution: CandleResolution
+  resolution: CandleResolution | LineResolution,
+  request: { outcome?: number; stored?: boolean; from?: string; to?: string } = {}
 ): Promise<NormalizedCandle[]> {
   const base = getApiBaseUrl();
-  const url = `${base}/api/v1/markets/${encodeURIComponent(marketId)}/candles?resolution=${encodeURIComponent(resolution)}`;
+  const params = new URLSearchParams({ resolution });
+  if (request.outcome != null && request.outcome > 0) {
+    params.set("outcome", String(request.outcome));
+  }
+  if (request.from && request.to) {
+    params.set("from", request.from);
+    params.set("to", request.to);
+  }
+  if (request.stored) params.set("stored", "1");
+  const url = `${base}/api/v1/markets/${encodeURIComponent(marketId)}/candles?${params.toString()}`;
   const res = await fetch(url);
 
   if (!res.ok) {
