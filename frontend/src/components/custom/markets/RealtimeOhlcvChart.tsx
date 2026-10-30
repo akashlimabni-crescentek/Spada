@@ -28,7 +28,6 @@ import {
   stripFormingBucket,
 } from "@/lib/candles/formingCandle";
 import { getApiBaseUrl } from "@/lib/apiBase";
-import { invertCandles } from "@/lib/candles/lineRange";
 import { normalizeCandles } from "@/lib/candles/normalize";
 import type { CandleResolution, NormalizedCandle } from "@/lib/candles/types";
 import type { OhlcvChartHandle } from "@/lib/charts/ohlcvChart";
@@ -98,22 +97,9 @@ async function fetchCandles(
   return normalizeCandles(await res.json());
 }
 
-function outcomePrice(
-  prices: number[] | undefined,
-  selectedOutcome: number,
-  binary = false
-): number | null {
+function outcomePrice(prices: number[] | undefined, selectedOutcome: number): number | null {
   const value = prices?.[selectedOutcome];
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (
-    binary &&
-    selectedOutcome === 1 &&
-    typeof prices?.[0] === "number" &&
-    Number.isFinite(prices[0])
-  ) {
-    return Number((1 - prices[0]).toFixed(6));
-  }
-  return null;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 export function RealtimeOhlcvChart({
@@ -269,19 +255,6 @@ export function RealtimeOhlcvChart({
         ohlcvWindow(aggregateCfg?.source ?? resolution),
         outcomeIndex
       );
-
-      // Binary markets: invert primary YES outcome 0 candles when outcome 1 (NO) has no direct records
-      if (rows.length === 0 && binary && outcomeIndex === 1) {
-        const primaryRows = await fetchCandles(
-          marketId,
-          aggregateCfg?.source ?? resolution,
-          ohlcvWindow(aggregateCfg?.source ?? resolution),
-          0
-        );
-        if (primaryRows.length > 0) {
-          rows = invertCandles(primaryRows);
-        }
-      }
       if (aggregateCfg) {
         console.log("[candle] history aggregate", {
           source: "history-table",
@@ -362,23 +335,12 @@ export function RealtimeOhlcvChart({
         const byInterval: Partial<Record<CandleResolution, NormalizedCandle[]>> = {};
         await Promise.all(
           ladder.map(async (rung) => {
-            let rows = await fetchCandles(
+            const rows = await fetchCandles(
               marketId,
               rung,
               { fromMs: bucket, toMs: now },
               outcomeIndex
             );
-            if (rows.length === 0 && binary && outcomeIndex === 1) {
-              const primaryRows = await fetchCandles(
-                marketId,
-                rung,
-                { fromMs: bucket, toMs: now },
-                0
-              );
-              if (primaryRows.length > 0) {
-                rows = invertCandles(primaryRows);
-              }
-            }
             const bucketSec = Math.floor(bucket / 1000);
             const nowSec = Math.floor(now / 1000);
             byInterval[rung] = rows.filter((r) => r.time >= bucketSec && r.time <= nowSec);
@@ -466,7 +428,7 @@ export function RealtimeOhlcvChart({
       const next = state.prices[marketId];
       const at = state.quotedAt[marketId];
       if (next === prev.prices[marketId] && at === prev.quotedAt[marketId]) return;
-      const price = outcomePrice(next, selectedOutcome, binary);
+      const price = outcomePrice(next, selectedOutcome);
       if (price == null || !at) return;
       const tsMs = Date.parse(at);
       if (!Number.isFinite(tsMs)) return;
