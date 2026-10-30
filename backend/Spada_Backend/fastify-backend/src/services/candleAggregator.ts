@@ -1172,6 +1172,7 @@ class CandleAggregator {
       .from('markets')
       .select('canonical_id, platform, external_id, volume, active')
       .eq('active', true)
+      .not('canonical_id', 'ilike', '%CROSSCATEGORY%')
       .order('canonical_id', { ascending: true })
       .limit(limit);
     if (error) {
@@ -1193,6 +1194,7 @@ class CandleAggregator {
         .from('markets')
         .select('canonical_id, platform, external_id, volume, active')
         .eq('active', true)
+        .not('canonical_id', 'ilike', '%CROSSCATEGORY%')
         .order('canonical_id', { ascending: true })
         .range(range.from, range.to);
       if (error) {

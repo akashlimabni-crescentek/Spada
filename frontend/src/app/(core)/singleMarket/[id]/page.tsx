@@ -127,7 +127,7 @@ export default function SingleMarketPage({ params }: { params: Promise<{ id: str
 
             {orderBook ? (
               <div data-testid="market-orderbook">
-                <OrderBook bids={orderBook.bids} asks={orderBook.asks} />
+                <OrderBook bids={orderBook.bids} asks={orderBook.asks} canonicalId={id} />
               </div>
             ) : !isOrderBookLoading ? (
               <Card className="p-4 min-w-0" data-testid="market-orderbook-empty">

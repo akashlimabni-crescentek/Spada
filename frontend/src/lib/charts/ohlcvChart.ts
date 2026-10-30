@@ -46,7 +46,21 @@ export type LineChartHandle = {
   destroy: () => void;
 };
 
+export type MultiLineChartSeries = {
+  id: number;
+  label: string;
+  color: string;
+  points: LineData<UTCTimestamp>[];
+};
+
 export type MultiLineChartHandle = {
+  /** Initial load or range change: set complete historical points and optionally fit content. */
+  setHistory: (seriesList: MultiLineChartSeries[], options?: { fit?: boolean }) => void;
+  /** Real-time O(1) tick update: append or update tip point without resetting zoom/pan. */
+  updateTick: (timeSec: number, getPrice: (id: number) => number | null) => void;
+  /** Re-sync after network reconnect: updates data while preserving visible logical range. */
+  resync: (seriesList: MultiLineChartSeries[]) => void;
+  /** Legacy setLines support */
   setLines: (lines: ChartLineSeries[], options?: { fit?: boolean }) => void;
   resize: (width: number, height: number) => void;
   destroy: () => void;
@@ -677,11 +691,15 @@ export function createLineChart(
   };
 }
 
-/** Multi-outcome line chart. Live tips are one point per second, so the axis shows seconds. */
+/** Multi-outcome line chart with real-time streaming updates and zoom preservation. */
 export function createMultiLineChart(
   container: HTMLElement,
-  height: number
+  wrapperOrHeight: HTMLElement | number,
+  maybeHeight?: number
 ): MultiLineChartHandle {
+  const wrapper = typeof wrapperOrHeight === "object" ? wrapperOrHeight : null;
+  const height = typeof wrapperOrHeight === "number" ? wrapperOrHeight : (maybeHeight ?? 420);
+
   const theme = readTheme();
   const chart = createChart(container, {
     width: container.clientWidth,
@@ -708,7 +726,8 @@ export function createMultiLineChart(
       borderColor: theme.border,
       timeVisible: true,
       secondsVisible: true,
-      rightOffset: 0,
+      rightOffset: 8,
+      barSpacing: 6,
       shiftVisibleRangeOnNewBar: true,
       tickMarkFormatter: (time: Time, tickMarkType: number) => {
         const seconds = timeToSeconds(time);
@@ -746,20 +765,189 @@ export function createMultiLineChart(
   });
 
   const seriesById = new Map<number, ISeriesApi<"Line">>();
-  const pointsById = new Map<number, ChartLinePoint[]>();
+  const lastPointsById = new Map<number, ChartLinePoint>();
+  const seriesMetaById = new Map<number, { label: string; color: string }>();
   let alive = true;
 
+  // Tooltip setup if wrapper is provided
+  let tooltip: HTMLDivElement | null = null;
+  const onCrosshair = (param: MouseEventParams) => {
+    if (!wrapper || !tooltip) return;
+    if (!param.time || !param.point || param.point.x < 0 || param.point.y < 0) {
+      tooltip.style.display = "none";
+      return;
+    }
+
+    const seconds = timeToSeconds(param.time);
+    if (seconds == null) {
+      tooltip.style.display = "none";
+      return;
+    }
+
+    const rows: string[] = [];
+    for (const [id, series] of seriesById) {
+      const point = param.seriesData.get(series) as ChartLinePoint | undefined;
+      if (!point || !Number.isFinite(point.value)) continue;
+      const meta = seriesMetaById.get(id);
+      const label = meta?.label ?? `Outcome ${id + 1}`;
+      const color = meta?.color ?? theme.crosshair;
+      const formattedVal = (point.value * 100).toFixed(1) + "%";
+      rows.push(`
+        <div class="ohlcv-tooltip-row" style="margin-top: 2px;">
+          <span class="ohlcv-tooltip-key" style="display: flex; align-items: center; gap: 6px;">
+            <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background-color: ${color}; flex-shrink: 0;"></span>
+            <span class="truncate" style="max-width: 130px;">${label}</span>
+          </span>
+          <span class="ohlcv-tooltip-val" style="color: ${color};">${formattedVal}</span>
+        </div>
+      `);
+    }
+
+    if (!rows.length) {
+      tooltip.style.display = "none";
+      return;
+    }
+
+    tooltip.innerHTML = `
+      <div class="ohlcv-tooltip-time">${formatGmt(seconds * 1000, true)}</div>
+      <div class="ohlcv-tooltip-grid">
+        ${rows.join("")}
+      </div>
+    `;
+    placeTooltip(tooltip, wrapper, param.point.x, param.point.y);
+  };
+
+  if (wrapper) {
+    if (getComputedStyle(wrapper).position === "static") {
+      wrapper.style.position = "relative";
+    }
+    tooltip = document.createElement("div");
+    tooltip.className = "ohlcv-tooltip";
+    tooltip.setAttribute("role", "tooltip");
+    wrapper.appendChild(tooltip);
+    chart.subscribeCrosshairMove(onCrosshair);
+  }
+
   return {
+    setHistory(seriesList: MultiLineChartSeries[], options: { fit?: boolean } = {}) {
+      const nextIds = new Set(seriesList.map((s) => s.id));
+      const shouldFit = options.fit === true;
+      const savedRange = chart.timeScale().getVisibleLogicalRange();
+
+      // Remove inactive series
+      for (const [id, series] of seriesById) {
+        if (!nextIds.has(id)) {
+          chart.removeSeries(series);
+          seriesById.delete(id);
+          lastPointsById.delete(id);
+          seriesMetaById.delete(id);
+        }
+      }
+
+      // Add or update active series
+      for (const item of seriesList) {
+        let series = seriesById.get(item.id);
+        if (!series) {
+          series = chart.addLineSeries({
+            color: item.color,
+            lineWidth: 2,
+            title: item.label,
+            priceLineVisible: false,
+            lastValueVisible: true,
+          });
+          seriesById.set(item.id, series);
+        } else {
+          series.applyOptions({ color: item.color, title: item.label });
+        }
+
+        seriesMetaById.set(item.id, { label: item.label, color: item.color });
+        series.setData(item.points);
+
+        if (item.points.length > 0) {
+          lastPointsById.set(item.id, item.points[item.points.length - 1]);
+        } else {
+          lastPointsById.delete(item.id);
+        }
+      }
+
+      // Fit content only when explicitly requested (e.g. initial load or range change)
+      if (shouldFit) {
+        chart.timeScale().fitContent();
+      } else if (savedRange) {
+        // Otherwise strictly preserve user's zoom/pan position
+        chart.timeScale().setVisibleLogicalRange(savedRange);
+      }
+    },
+
+    updateTick(timeSec: number, getPrice: (id: number) => number | null) {
+      for (const [id, series] of seriesById) {
+        const price = getPrice(id);
+        if (price == null || !Number.isFinite(price)) continue;
+
+        const last = lastPointsById.get(id);
+        if (!last) {
+          const pt: ChartLinePoint = { time: timeSec as UTCTimestamp, value: price };
+          series.setData([pt]);
+          lastPointsById.set(id, pt);
+          continue;
+        }
+
+        const lastTime = last.time as number;
+        if (timeSec > lastTime) {
+          // 1. timeSec > last.time: Append new point (O(1))
+          const pt: ChartLinePoint = { time: timeSec as UTCTimestamp, value: price };
+          series.update(pt);
+          lastPointsById.set(id, pt);
+        } else if (timeSec === lastTime) {
+          // 2. timeSec === last.time: Update existing tip value (O(1))
+          if (last.value !== price) {
+            const pt: ChartLinePoint = { time: last.time, value: price };
+            series.update(pt);
+            lastPointsById.set(id, pt);
+          }
+        }
+        // 3. timeSec < lastTime: Out-of-order tick, safely ignore
+      }
+    },
+
+    resync(seriesList: MultiLineChartSeries[]) {
+      // Preserve user's visible range during reconnect resync
+      const savedRange = chart.timeScale().getVisibleLogicalRange();
+
+      for (const item of seriesList) {
+        let series = seriesById.get(item.id);
+        if (!series) {
+          series = chart.addLineSeries({
+            color: item.color,
+            lineWidth: 2,
+            title: item.label,
+            priceLineVisible: false,
+            lastValueVisible: true,
+          });
+          seriesById.set(item.id, series);
+        }
+        seriesMetaById.set(item.id, { label: item.label, color: item.color });
+        series.setData(item.points);
+        if (item.points.length > 0) {
+          lastPointsById.set(item.id, item.points[item.points.length - 1]);
+        }
+      }
+
+      if (savedRange) {
+        chart.timeScale().setVisibleLogicalRange(savedRange);
+      }
+    },
+
     setLines(lines, options = {}) {
       const fit = options.fit === true;
-      const scale = chart.timeScale();
       const nextIds = new Set(lines.map((line) => line.id));
 
       for (const [id, series] of seriesById) {
         if (!nextIds.has(id)) {
           chart.removeSeries(series);
           seriesById.delete(id);
-          pointsById.delete(id);
+          lastPointsById.delete(id);
+          seriesMetaById.delete(id);
         }
       }
 
@@ -777,39 +965,41 @@ export function createMultiLineChart(
           });
           seriesById.set(line.id, series);
           series.setData(chartPoints);
-          pointsById.set(line.id, chartPoints);
-          continue;
-        }
-
-        series.applyOptions({ color: line.color, title: line.label });
-        const prev = pointsById.get(line.id) ?? [];
-        const last = chartPoints[chartPoints.length - 1];
-        if (!last) {
-          series.setData([]);
-          pointsById.set(line.id, []);
-          continue;
-        }
-
-        if (isLastPointUpdate(prev, chartPoints) || isAppendPoint(prev, chartPoints)) {
-          series.update(last);
         } else {
-          series.setData(chartPoints);
+          series.applyOptions({ color: line.color, title: line.label });
+          const prev = lastPointsById.get(line.id);
+          const last = chartPoints[chartPoints.length - 1];
+          if (!last) {
+            series.setData([]);
+            lastPointsById.delete(line.id);
+            continue;
+          }
+          if (prev && prev.time === last.time) {
+            series.update(last);
+          } else {
+            series.setData(chartPoints);
+          }
         }
-        pointsById.set(line.id, chartPoints);
+        seriesMetaById.set(line.id, { label: line.label, color: line.color });
+        if (chartPoints.length > 0) {
+          lastPointsById.set(line.id, chartPoints[chartPoints.length - 1]);
+        }
       }
 
-      const hasPoints = lines.some((line) => line.points.length > 0);
-      // A fitted series hides new ticks: every point stays on screen, so the edge never moves.
-      // The first view uses a fixed bar width and sits on the newest point. Later ticks keep
-      // the mouse zoom and only pull that newest point back to the right border.
-      if (fit) scale.applyOptions({ barSpacing: 8, rightOffset: 0 });
-      if (hasPoints) pinLatestBar(chart, () => alive);
+      if (fit) chart.timeScale().fitContent();
     },
+
     resize(width, nextHeight) {
       chart.applyOptions({ width, height: nextHeight });
     },
+
     destroy() {
       alive = false;
+      if (tooltip) {
+        chart.unsubscribeCrosshairMove(onCrosshair);
+        tooltip.remove();
+        tooltip = null;
+      }
       chart.remove();
     },
   };

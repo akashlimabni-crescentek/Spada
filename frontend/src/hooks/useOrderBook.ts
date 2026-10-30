@@ -1,9 +1,11 @@
 // src/hooks/useOrderBook.ts
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { getApiBaseUrl } from "@/lib/apiBase";
+import { usePriceStore } from "@/stores/usePriceStore";
 
 export interface OrderLevel {
   price: number | string;
@@ -163,10 +165,33 @@ async function fetchOrderBook(canonicalId: string): Promise<OrderBookResponse> {
 }
 
 export function useOrderBook(canonicalId: string) {
+  const queryClient = useQueryClient();
+  const lastTickPriceRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!canonicalId) return;
+
+    // Immediately trigger orderbook refresh when WebSocket pushes a new price tick
+    const unsub = usePriceStore.subscribe((state) => {
+      const p = state.prices[canonicalId];
+      if (p && p.length > 0 && Number.isFinite(p[0])) {
+        if (lastTickPriceRef.current !== p[0]) {
+          lastTickPriceRef.current = p[0];
+          void queryClient.invalidateQueries({
+            queryKey: ["orderbook", canonicalId],
+            refetchType: "active",
+          });
+        }
+      }
+    });
+
+    return () => unsub();
+  }, [canonicalId, queryClient]);
+
   return useQuery({
     queryKey: ["orderbook", canonicalId],
     queryFn: () => fetchOrderBook(canonicalId),
     enabled: !!canonicalId,
-    refetchInterval: 5000,
+    refetchInterval: 2500,
   });
 }
