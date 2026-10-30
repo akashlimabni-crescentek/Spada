@@ -373,8 +373,10 @@ export function RealtimeLineChart({
         <div className="status-banner status-banner-warn">Failed to load chart data</div>
       ) : null}
       {status === "empty" ? (
-        <div className="status-banner status-banner-warn">
-          No chart data yet — promote this event to hot and wait for history backfill.
+        <div className="chart-empty-overlay">
+          <div className="chart-empty-message">
+            <span>No historical chart data available for this market yet.</span>
+          </div>
         </div>
       ) : null}
       <div ref={containerRef} className="chart-shell" style={{ height, minHeight: height }} />
