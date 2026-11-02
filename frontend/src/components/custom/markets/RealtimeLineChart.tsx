@@ -20,6 +20,7 @@ import {
 import type { MultiLineChartHandle, MultiLineChartSeries } from "@/lib/charts/ohlcvChart";
 import { onPriceStreamReconnect } from "@/providers/priceStreamConnector";
 import { usePriceStore } from "@/stores/usePriceStore";
+import type { Market } from "@/types/market";
 
 type Status = "loading" | "ready" | "empty" | "error";
 
@@ -30,6 +31,7 @@ export type RealtimeLineChartProps = {
   outcomes: string[];
   binary: boolean;
   height: number;
+  market?: Market;
 };
 
 /** Deduplicate timestamps (keep newest close value) and ensure ascending order. */
@@ -57,6 +59,7 @@ export function RealtimeLineChart({
   outcomes,
   binary,
   height,
+  market,
 }: RealtimeLineChartProps) {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -69,6 +72,7 @@ export function RealtimeLineChart({
   const prevRangeRef = useRef<string>("");
   const rafIdRef = useRef<number | null>(null);
   const pendingTickRef = useRef<{ timeSec: number; prices: number[] } | null>(null);
+  const loadedCandlesRef = useRef<Map<number, NormalizedCandle[]>>(new Map());
 
   const [status, setStatus] = useState<Status>("loading");
 
@@ -79,8 +83,9 @@ export function RealtimeLineChart({
     visibleIds,
     outcomes,
     binary,
+    market,
   });
-  configRef.current = { marketId, range, visibleIds, outcomes, binary };
+  configRef.current = { marketId, range, visibleIds, outcomes, binary, market };
 
   // 1. Chart instance lifecycle: created once per height; survives market/range/tick updates.
   useEffect(() => {
@@ -133,19 +138,22 @@ export function RealtimeLineChart({
       targetBinary: boolean
     ): MultiLineChartSeries[] => {
       const primaryPoints = deduplicateAndSort(
-        linePointsFromCandles(candlesByOutcome.get(0) ?? [], targetRange)
+        linePointsFromCandles(candlesByOutcome.get(0) ?? [])
       );
 
       const quote = usePriceStore.getState();
       const quoteAt = quote.quotedAt[marketId];
-      const quotePrices = quote.prices[marketId];
+      const quotePrices = quote.prices[marketId] ?? configRef.current.market?.prices;
       const timeSec = quoteAt ? Math.floor(Date.parse(quoteAt) / 1000) : NaN;
+      const nowSec = Math.floor(Date.now() / 1000);
+      const windowMs = lineRangeMs(targetRange);
+      const cutoff = windowMs == null ? null : Math.floor((Date.now() - windowMs) / 1000);
 
       const list: MultiLineChartSeries[] = [];
 
       for (const id of targetVisibleIds) {
         let pts = deduplicateAndSort(
-          linePointsFromCandles(candlesByOutcome.get(id) ?? [], targetRange)
+          linePointsFromCandles(candlesByOutcome.get(id) ?? [])
         );
 
         // Binary No inverse from Yes if outcome 1 has no native candles
@@ -162,16 +170,11 @@ export function RealtimeLineChart({
           if (livePrice != null) {
             const last = pts[pts.length - 1];
             if (!last) {
-              const windowMs = lineRangeMs(targetRange);
-              const cutoff = windowMs == null ? null : Math.floor((Date.now() - windowMs) / 1000);
-              if (cutoff != null && cutoff < timeSec) {
-                pts = [
-                  { time: cutoff, value: livePrice },
-                  { time: timeSec, value: livePrice },
-                ];
-              } else {
-                pts = [{ time: timeSec, value: livePrice }];
-              }
+              const startSec = cutoff != null ? cutoff : timeSec - 3600;
+              pts = [
+                { time: startSec, value: livePrice },
+                { time: timeSec, value: livePrice },
+              ];
             } else if (timeSec > last.time) {
               pts = [...pts, { time: timeSec, value: livePrice }];
             } else if (timeSec === last.time) {
@@ -180,13 +183,36 @@ export function RealtimeLineChart({
           }
         }
 
+        // Fallback for active markets with no historical candles:
+        // Synthesize a flat line using market's current/initial price
+        if (!pts.length) {
+          const m = configRef.current.market;
+          const fallbackPrice =
+            linePriceForOutcome(quotePrices ?? m?.prices ?? [], id, targetBinary) ??
+            m?.outcome_prices?.[id]?.price ??
+            (id === 0 ? m?.yes_price : id === 1 ? m?.no_price : null);
+
+          if (fallbackPrice != null && Number.isFinite(fallbackPrice)) {
+            const startSec = cutoff != null ? cutoff : nowSec - 86400;
+            pts = [
+              { time: startSec, value: fallbackPrice },
+              { time: nowSec, value: fallbackPrice },
+            ];
+          }
+        }
+
+        // Ensure line extends to nowSec (right edge)
+        if (pts.length > 0 && pts[pts.length - 1].time < nowSec) {
+          pts.push({ time: nowSec, value: pts[pts.length - 1].value });
+        }
+
         // If an outcome series has only 1 point, synthesize a start point so lightweight-charts can render a line segment
         if (pts.length === 1) {
-          const windowMs = lineRangeMs(targetRange);
-          const cutoff = windowMs == null ? null : Math.floor((Date.now() - windowMs) / 1000);
-          const start = cutoff != null && cutoff < pts[0].time ? cutoff : pts[0].time - 60;
+          const start = pts[0].time - 60;
           pts = [{ time: start, value: pts[0].value }, pts[0]];
         }
+
+        pts = deduplicateAndSort(pts);
 
         if (pts.length > 0) {
           list.push({
@@ -215,6 +241,22 @@ export function RealtimeLineChart({
 
     const token = ++tokenRef.current;
 
+    // Fast-path: If the market hasn't changed and history is already in memory,
+    // just instantly adjust the viewport zoom (timeRange) without re-fetching!
+    if (historyReadyRef.current && !isNewMarket && isNewRange && loadedCandlesRef.current.size > 0) {
+      const windowMs = lineRangeMs(range);
+      const cutoff = windowMs == null ? null : Math.floor((Date.now() - windowMs) / 1000);
+      const nowSec = Math.floor(Date.now() / 1000);
+      void chartReadyRef.current.then((handle) => {
+        if (handle && token === tokenRef.current) {
+          handle.setVisibleTimeRange(
+            range === "ALL" ? undefined : cutoff != null ? { from: cutoff, to: nowSec } : undefined
+          );
+        }
+      });
+      return;
+    }
+
     // Only display "Loading chart..." on cold initial load or market switch — never on ticks or chips!
     if (!historyReadyRef.current || isNewMarket) {
       historyReadyRef.current = false;
@@ -228,65 +270,78 @@ export function RealtimeLineChart({
     }
 
     const cfg = configRef.current;
-    const lineResolution = lineRangeToResolution(range);
-    const { from, to } = lineRangeToWindow(range);
     const ids = new Set(cfg.visibleIds);
     if (binary && ids.has(1)) ids.add(0);
 
     const loadHistory = async () => {
       try {
+        const fromHistoryIso = new Date(Date.now() - 365 * 24 * 3600 * 1000).toISOString();
+        const toIso = new Date().toISOString();
+        const fromRecentIso = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+
+        // 1. Fetch comprehensive history (1h stored candles up to 365 days)
         let entries = await Promise.all(
           [...ids].map(async (id) => {
-            const rows = await fetchMarketCandles(marketId, lineResolution, {
+            const rows = await fetchMarketCandles(marketId, "1h", {
               outcome: id,
               stored: true,
-              from,
-              to,
-            });
+              from: fromHistoryIso,
+              to: toIso,
+            }).catch(() => [] as NormalizedCandle[]);
             return [id, rows] as const;
           })
         );
 
-        if (token !== tokenRef.current) return;
-
         let candlesMap = new Map(entries);
-        let hasRows = [...candlesMap.values()].some((rows) => rows.length > 0);
+        const hasHistory = [...candlesMap.values()].some((rows) => rows.length > 0);
 
-        // Fallback 1: If 1m resolution has no candles (e.g. Kalshi only stores 5m+),
-        // fallback to 5m resolution within the same time window.
-        if (!hasRows && lineResolution === "1m") {
+        // Fallback to 5m if 1h has no candles
+        if (!hasHistory) {
           entries = await Promise.all(
             [...ids].map(async (id) => {
               const rows = await fetchMarketCandles(marketId, "5m", {
                 outcome: id,
                 stored: true,
-                from,
-                to,
-              });
+                from: fromHistoryIso,
+                to: toIso,
+              }).catch(() => [] as NormalizedCandle[]);
               return [id, rows] as const;
             })
           );
-          if (token !== tokenRef.current) return;
           candlesMap = new Map(entries);
-          hasRows = [...candlesMap.values()].some((rows) => rows.length > 0);
         }
 
-        // Fallback 2: If still no rows within the restricted time window (from..to),
-        // fetch stored candles without from/to so earlier history can anchor the line across this window.
-        if (!hasRows && (range === "1H" || range === "6H")) {
-          entries = await Promise.all(
-            [...ids].map(async (id) => {
-              const rows = await fetchMarketCandles(marketId, "5m", {
+        // 2. Fetch granular 1m candles for the last 24h to provide fine detail in 1H/6H views
+        const recentEntries = await Promise.all(
+          [...ids].map(async (id) => {
+            try {
+              const rows = await fetchMarketCandles(marketId, "1m", {
                 outcome: id,
                 stored: true,
+                from: fromRecentIso,
+                to: toIso,
               });
               return [id, rows] as const;
-            })
-          );
-          if (token !== tokenRef.current) return;
-          candlesMap = new Map(entries);
-          hasRows = [...candlesMap.values()].some((rows) => rows.length > 0);
-        }
+            } catch {
+              return [id, [] as NormalizedCandle[]] as const;
+            }
+          })
+        );
+        const recentMap = new Map(recentEntries);
+
+        // 3. Merge history + recent candles for each outcome (deduplicating by timestamp)
+        const mergedEntries: Array<[number, NormalizedCandle[]]> = [...ids].map((id) => {
+          const base = candlesMap.get(id) ?? [];
+          const recent = recentMap.get(id) ?? [];
+          const byTime = new Map<number, NormalizedCandle>();
+          for (const c of base) byTime.set(c.time, c);
+          for (const c of recent) byTime.set(c.time, c);
+          const sorted = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+          return [id, sorted];
+        });
+
+        candlesMap = new Map(mergedEntries);
+        loadedCandlesRef.current = candlesMap;
 
         const seriesList = buildSeriesList(
           candlesMap,
@@ -307,10 +362,19 @@ export function RealtimeLineChart({
           return;
         }
 
-        // Fit content ONLY on initial market load or when user changed the time range button.
-        // If user already zoomed in, preserve their exact zoom/pan viewport!
-        const fit = isNewMarket || isNewRange;
-        handle.setHistory(seriesList, { fit });
+        const windowMs = lineRangeMs(range);
+        const cutoff = windowMs == null ? null : Math.floor((Date.now() - windowMs) / 1000);
+        const nowSec = Math.floor(Date.now() / 1000);
+
+        handle.setHistory(seriesList, {
+          fit: true,
+          timeRange:
+            range === "ALL"
+              ? undefined
+              : cutoff != null
+              ? { from: cutoff, to: nowSec }
+              : undefined,
+        });
         historyReadyRef.current = true;
         setStatus("ready");
       } catch (err) {
@@ -386,39 +450,44 @@ export function RealtimeLineChart({
       if (!handle || !historyReadyRef.current) return;
 
       const cfg = configRef.current;
-      const lineResolution = lineRangeToResolution(cfg.range);
-      const { from, to } = lineRangeToWindow(cfg.range);
       const ids = new Set(cfg.visibleIds);
       if (cfg.binary && ids.has(1)) ids.add(0);
 
       try {
-        let entries = await Promise.all(
+        const fromRecentIso = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+        const toIso = new Date().toISOString();
+
+        const recentEntries = await Promise.all(
           [...ids].map(async (id) => {
-            const rows = await fetchMarketCandles(cfg.marketId, lineResolution, {
-              outcome: id,
-              stored: true,
-              from,
-              to,
-            });
-            return [id, rows] as const;
-          })
-        );
-        let candlesMap = new Map(entries);
-        let hasRows = [...candlesMap.values()].some((rows) => rows.length > 0);
-        if (!hasRows && lineResolution === "1m") {
-          entries = await Promise.all(
-            [...ids].map(async (id) => {
-              const rows = await fetchMarketCandles(cfg.marketId, "5m", {
+            try {
+              const rows = await fetchMarketCandles(cfg.marketId, "1m", {
                 outcome: id,
                 stored: true,
-                from,
-                to,
+                from: fromRecentIso,
+                to: toIso,
               });
               return [id, rows] as const;
-            })
-          );
-          candlesMap = new Map(entries);
-        }
+            } catch {
+              return [id, [] as NormalizedCandle[]] as const;
+            }
+          })
+        );
+        const recentMap = new Map(recentEntries);
+
+        // Merge latest recent candles into existing loaded candles
+        const mergedEntries: Array<[number, NormalizedCandle[]]> = [...ids].map((id) => {
+          const base = loadedCandlesRef.current.get(id) ?? [];
+          const recent = recentMap.get(id) ?? [];
+          const byTime = new Map<number, NormalizedCandle>();
+          for (const c of base) byTime.set(c.time, c);
+          for (const c of recent) byTime.set(c.time, c);
+          const sorted = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+          return [id, sorted];
+        });
+
+        const candlesMap = new Map(mergedEntries);
+        loadedCandlesRef.current = candlesMap;
+
         const seriesList = buildSeriesList(
           candlesMap,
           cfg.range,

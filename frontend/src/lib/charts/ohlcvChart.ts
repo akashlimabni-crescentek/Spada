@@ -55,7 +55,12 @@ export type MultiLineChartSeries = {
 
 export type MultiLineChartHandle = {
   /** Initial load or range change: set complete historical points and optionally fit content. */
-  setHistory: (seriesList: MultiLineChartSeries[], options?: { fit?: boolean }) => void;
+  setHistory: (
+    seriesList: MultiLineChartSeries[],
+    options?: { fit?: boolean; timeRange?: { from: number; to: number } }
+  ) => void;
+  /** Set viewport visible time range (zoom) without reloading series data. */
+  setVisibleTimeRange: (timeRange?: { from: number; to: number }) => void;
   /** Real-time O(1) tick update: append or update tip point without resetting zoom/pan. */
   updateTick: (timeSec: number, getPrice: (id: number) => number | null) => void;
   /** Re-sync after network reconnect: updates data while preserving visible logical range. */
@@ -829,7 +834,10 @@ export function createMultiLineChart(
   }
 
   return {
-    setHistory(seriesList: MultiLineChartSeries[], options: { fit?: boolean } = {}) {
+    setHistory(
+      seriesList: MultiLineChartSeries[],
+      options: { fit?: boolean; timeRange?: { from: number; to: number } } = {}
+    ) {
       const nextIds = new Set(seriesList.map((s) => s.id));
       const shouldFit = options.fit === true;
       const savedRange = chart.timeScale().getVisibleLogicalRange();
@@ -870,12 +878,47 @@ export function createMultiLineChart(
         }
       }
 
-      // Fit content only when explicitly requested (e.g. initial load or range change)
-      if (shouldFit) {
+      // Fit content or set visible range when range changes or initial load
+      if (options.timeRange && shouldFit) {
+        const tr = options.timeRange;
+        const applyRange = () => {
+          if (!alive) return;
+          try {
+            chart.timeScale().setVisibleRange({
+              from: tr.from as UTCTimestamp,
+              to: tr.to as UTCTimestamp,
+            });
+          } catch {
+            // ignore
+          }
+        };
+        applyRange();
+        requestAnimationFrame(applyRange);
+      } else if (shouldFit) {
         chart.timeScale().fitContent();
       } else if (savedRange) {
         // Otherwise strictly preserve user's zoom/pan position
         chart.timeScale().setVisibleLogicalRange(savedRange);
+      }
+    },
+
+    setVisibleTimeRange(timeRange?: { from: number; to: number }) {
+      if (timeRange) {
+        const applyRange = () => {
+          if (!alive) return;
+          try {
+            chart.timeScale().setVisibleRange({
+              from: timeRange.from as UTCTimestamp,
+              to: timeRange.to as UTCTimestamp,
+            });
+          } catch {
+            // ignore
+          }
+        };
+        applyRange();
+        requestAnimationFrame(applyRange);
+      } else {
+        chart.timeScale().fitContent();
       }
     },
 

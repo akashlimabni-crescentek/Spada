@@ -357,23 +357,23 @@ export function fillCandleGaps(
 export function maxCandlesForResolution(resolution: FormingInterval): number {
   const fromEnv = Number(process.env.CANDLE_MAX_BARS);
   if (Number.isFinite(fromEnv) && fromEnv > 0) {
-    return Math.min(Math.floor(fromEnv), 2000);
+    return Math.min(Math.floor(fromEnv), 100000);
   }
   switch (resolution) {
     case '5m':
-      return 288; // ~24h
+      return 50000;
     case '15m':
-      return 288; // ~3d
+      return 50000;
     case '1h':
-      return 336; // ~14d
+      return 50000;
     case '4h':
-      return 360; // ~60d
+      return 50000;
     case '1d':
-      return 365;
+      return 10000;
     case '1w':
-      return 104;
+      return 5000;
     default:
-      return 100;
+      return 50000;
   }
 }
 

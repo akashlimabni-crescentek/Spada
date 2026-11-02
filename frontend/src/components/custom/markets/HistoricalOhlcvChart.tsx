@@ -213,6 +213,7 @@ export function HistoricalOhlcvChart({ market }: HistoricalOhlcvChartProps) {
           outcomes={outcomes}
           binary={binary}
           height={chartHeight}
+          market={market}
         />
       ) : (
         <RealtimeOhlcvChart

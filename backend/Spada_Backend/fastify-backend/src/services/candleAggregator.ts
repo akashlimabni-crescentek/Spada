@@ -76,10 +76,10 @@ const INTERVAL_SECONDS: Record<StoredInterval, number> = {
 
 /** Lookback window large enough to fill resolution-aware bar budgets */
 const LOOKBACK_SECONDS: Record<CandleResolution, number> = {
-  '5m': 30 * 24 * 60 * 60,
-  '15m': 30 * 24 * 60 * 60,
-  '1h': 90 * 24 * 60 * 60,
-  '4h': 90 * 24 * 60 * 60,
+  '5m': 365 * 24 * 60 * 60,
+  '15m': 365 * 24 * 60 * 60,
+  '1h': 365 * 24 * 60 * 60,
+  '4h': 365 * 24 * 60 * 60,
   '1d': 365 * 24 * 60 * 60,
   '1w': 365 * 24 * 60 * 60,
 };
@@ -641,7 +641,7 @@ class CandleAggregator {
 
     // Price history is indexed by ticker. Start it with the RPC so a slow
     // aggregation does not add another round trip before we can answer.
-    const historyPromise = this.fromPriceHistory(market, resolution).catch(() => [] as Candle[]);
+    const historyPromise = this.fromPriceHistory(market, resolution, { fromMs, toMs }).catch(() => [] as Candle[]);
 
     let rpcTimedOut = false;
     if (ticker) {
@@ -825,7 +825,7 @@ class CandleAggregator {
     const scoped = await this.marketScopedToOutcome(canonicalId, outcomeIndex);
     if (!scoped) return [];
 
-    const rows = await this.fromPriceHistory(scoped, resolution);
+    const rows = await this.fromPriceHistory(scoped, resolution, { fromMs, toMs });
     return rows
       .filter((candle) => {
         const t = new Date(candle.bucket).getTime();
@@ -1870,75 +1870,134 @@ class CandleAggregator {
 
   private async fromPriceHistory(
     market: { canonical_id: string; platform: string; external_id: string | null; raw_data: any },
-    resolution: CandleResolution
+    resolution: CandleResolution,
+    window?: { fromMs: number; toMs: number }
   ): Promise<Candle[]> {
     const max = maxCandlesForResolution(resolution);
+    const PAGE_SIZE = 1000;
+
     if (market.platform === 'polymarket') {
       const tokenId = getPrimaryPolyToken(market.raw_data ?? {});
       if (!tokenId) return [];
-      const { data, error } = await supabaseAdmin
-        .from('polymarket_price_history')
-        .select('ts, open, high, low, close, volume')
-        .eq('token_id', tokenId)
-        .eq('interval', resolution)
-        .order('ts', { ascending: false })
-        .limit(max);
-      if (error) {
-        console.warn(
-          `[CandleAggregator] polymarket_price_history: ${error.message.slice(0, 200)}`
-        );
-        return [];
+      const rows: Candle[] = [];
+      let offset = 0;
+      while (true) {
+        let q = supabaseAdmin
+          .from('polymarket_price_history')
+          .select('ts, open, high, low, close, volume')
+          .eq('token_id', tokenId)
+          .eq('interval', resolution);
+
+        if (window) {
+          q = q
+            .gte('ts', new Date(window.fromMs).toISOString())
+            .lte('ts', new Date(window.toMs).toISOString());
+        }
+
+        const { data, error } = await q
+          .order('ts', { ascending: true })
+          .range(offset, offset + PAGE_SIZE - 1);
+
+        if (error) {
+          console.warn(
+            `[CandleAggregator] polymarket_price_history: ${error.message.slice(0, 200)}`
+          );
+          break;
+        }
+        if (!data?.length) break;
+
+        for (const row of data) {
+          const open = Number(row.open);
+          const high = Number(row.high);
+          const low = Number(row.low);
+          const close = Number(row.close);
+          if (
+            Number.isFinite(open) &&
+            Number.isFinite(high) &&
+            Number.isFinite(low) &&
+            Number.isFinite(close)
+          ) {
+            rows.push({
+              ticker: market.canonical_id,
+              bucket: new Date(row.ts).toISOString(),
+              open,
+              high,
+              low,
+              close,
+              volume: Number(row.volume || 0),
+            });
+          }
+        }
+
+        if (data.length < PAGE_SIZE || rows.length >= max) break;
+        offset += PAGE_SIZE;
+        if (offset >= 100000) break;
       }
-      if (!data?.length) return [];
-      return data.map((row) => ({
-        ticker: market.canonical_id,
-        bucket: new Date(row.ts).toISOString(),
-        open: Number(row.open),
-        high: Number(row.high),
-        low: Number(row.low),
-        close: Number(row.close),
-        volume: Number(row.volume || 0),
-      }));
+      return rows;
     }
 
     if (market.platform === 'kalshi') {
       const ticker = market.external_id ? String(market.external_id) : null;
       if (!ticker) return [];
-      const { data, error } = await supabaseAdmin
-        .from('kalshi_price_history')
-        .select('ts, price_open, price_high, price_low, price_close, volume')
-        .eq('ticker', ticker)
-        .eq('interval', resolution)
-        .order('ts', { ascending: false })
-        .limit(max);
-      if (error) {
-        console.warn(
-          `[CandleAggregator] kalshi_price_history: ${error.message.slice(0, 200)}`
-        );
-        return [];
+      const rows: Candle[] = [];
+      let offset = 0;
+      while (true) {
+        let q = supabaseAdmin
+          .from('kalshi_price_history')
+          .select('ts, price_open, price_high, price_low, price_close, volume')
+          .eq('ticker', ticker)
+          .eq('interval', resolution);
+
+        if (window) {
+          q = q
+            .gte('ts', new Date(window.fromMs).toISOString())
+            .lte('ts', new Date(window.toMs).toISOString());
+        }
+
+        const { data, error } = await q
+          .order('ts', { ascending: true })
+          .range(offset, offset + PAGE_SIZE - 1);
+
+        if (error) {
+          console.warn(
+            `[CandleAggregator] kalshi_price_history: ${error.message.slice(0, 200)}`
+          );
+          break;
+        }
+        if (!data?.length) break;
+
+        for (const row of data) {
+          const open = Number(row.price_open);
+          const high = Number(row.price_high);
+          const low = Number(row.price_low);
+          const close = Number(row.price_close);
+          if (
+            Number.isFinite(open) &&
+            Number.isFinite(high) &&
+            Number.isFinite(low) &&
+            Number.isFinite(close)
+          ) {
+            rows.push({
+              ticker: market.canonical_id,
+              bucket: new Date(row.ts).toISOString(),
+              open,
+              high,
+              low,
+              close,
+              volume: Number(row.volume || 0),
+            });
+          }
+        }
+
+        if (data.length < PAGE_SIZE || rows.length >= max) break;
+        offset += PAGE_SIZE;
+        if (offset >= 100000) break;
       }
-      if (!data?.length) return [];
-      return data
-        .map((row) => ({
-          ticker: market.canonical_id,
-          bucket: new Date(row.ts).toISOString(),
-          open: Number(row.price_open),
-          high: Number(row.price_high),
-          low: Number(row.price_low),
-          close: Number(row.price_close),
-          volume: Number(row.volume || 0),
-        }))
-        .filter(
-          (c) =>
-            Number.isFinite(c.open) &&
-            Number.isFinite(c.high) &&
-            Number.isFinite(c.low) &&
-            Number.isFinite(c.close)
-        );
+      return rows;
     }
 
-          return [];
-        }
+    return [];
+  }
 
   private async fromPolymarketApi(
     market: { canonical_id: string; raw_data: any },

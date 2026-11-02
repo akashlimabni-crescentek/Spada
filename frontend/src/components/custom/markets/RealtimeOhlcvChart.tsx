@@ -40,14 +40,14 @@ const FINER_REFETCH_MS = 15_000;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** Same lookbacks as the POC `OHLCV_SOURCE`. */
+/** Same lookbacks as the POC `OHLCV_SOURCE` — extended to 365d for full market history. */
 const OHLCV_LOOKBACK_MS: Record<CandleResolution, number> = {
-  "5m": 30 * DAY_MS,
-  "15m": 30 * DAY_MS,
-  "1h": 90 * DAY_MS,
-  "4h": 90 * DAY_MS,
-  "1d": 365 * DAY_MS,
-  "1w": 365 * DAY_MS,
+  "5m": 365 * DAY_MS,
+  "15m": 365 * DAY_MS,
+  "1h": 365 * DAY_MS,
+  "4h": 365 * DAY_MS,
+  "1d": 365 * 2 * DAY_MS,
+  "1w": 365 * 2 * DAY_MS,
 };
 
 /**

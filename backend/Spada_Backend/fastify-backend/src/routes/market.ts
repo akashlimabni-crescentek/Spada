@@ -518,10 +518,10 @@ export async function marketRoutes(fastify: FastifyInstance) {
         if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs < fromMs) {
           return reply.status(400).send({ error: 'from and to must be valid timestamps' });
         }
-        // POC OHLCV 1d/1w look back 365 days. The line chart ALL range stays 90 days.
-        const maxWindowMs = 365 * 24 * 60 * 60 * 1000;
+        // Support long-running market histories (up to 10 years).
+        const maxWindowMs = 10 * 365 * 24 * 60 * 60 * 1000;
         if (toMs - fromMs > maxWindowMs) {
-          return reply.status(400).send({ error: 'from/to window cannot exceed 365 days' });
+          return reply.status(400).send({ error: 'from/to window cannot exceed 10 years' });
         }
         if (resolutionParam === '1m') {
           const candles = await candleAggregator.getOneMinuteCandles(id, fromMs, toMs, outcomeIndex);

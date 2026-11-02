@@ -13,8 +13,8 @@ const HOUR = 60 * 60 * 1000;
 export type LineResolution = CandleResolution | "1m";
 
 const DAY = 24 * HOUR;
-/** POC ALL lookback. */
-const LINE_ALL_LOOKBACK_MS = 90 * DAY;
+/** Lookback for full history on line chart (up to 365 days). */
+const LINE_ALL_LOOKBACK_MS = 365 * DAY;
 
 /**
  * Same source intervals as the POC line chart.
@@ -62,38 +62,39 @@ export function lineRangeMs(range: LineRange): number {
   }
 }
 
-export function linePointsFromCandles(candles: NormalizedCandle[], range: LineRange): LinePoint[] {
-  const windowMs = lineRangeMs(range);
-  const cutoff = windowMs == null ? null : Math.floor((Date.now() - windowMs) / 1000);
+export function linePointsFromCandles(candles: NormalizedCandle[], range?: LineRange): LinePoint[] {
+  const nowSec = Math.floor(Date.now() / 1000);
   const points: LinePoint[] = [];
-  let lastBeforeCutoff: NormalizedCandle | null = null;
 
   for (const candle of candles) {
-    if (cutoff != null && candle.time < cutoff) {
-      if (!lastBeforeCutoff || candle.time > lastBeforeCutoff.time) {
-        lastBeforeCutoff = candle;
-      }
-      continue;
-    }
-    points.push({ time: candle.time, value: candle.close });
-  }
-
-  // If we have an earlier candle before the cutoff window:
-  if (cutoff != null && lastBeforeCutoff) {
-    if (points.length > 0 && points[0].time > cutoff) {
-      // Anchor the start of the visible window using the latest candle before cutoff
-      points.unshift({ time: cutoff, value: lastBeforeCutoff.close });
-    } else if (points.length === 0) {
-      // No trades within this window, carry forward the last known price to current time
-      const nowSec = Math.floor(Date.now() / 1000);
-      points.push({ time: cutoff, value: lastBeforeCutoff.close });
-      if (nowSec > cutoff) {
-        points.push({ time: nowSec, value: lastBeforeCutoff.close });
-      }
+    if (Number.isFinite(candle.time) && Number.isFinite(candle.close)) {
+      points.push({ time: candle.time, value: candle.close });
     }
   }
 
-  return points;
+  if (!points.length) return [];
+
+  // Deduplicate and sort points chronologically ascending
+  const sorted = points.sort((a, b) => a.time - b.time);
+  const deduped: LinePoint[] = [];
+  for (const pt of sorted) {
+    const last = deduped[deduped.length - 1];
+    if (!last || pt.time > last.time) {
+      deduped.push(pt);
+    } else if (pt.time === last.time) {
+      deduped[deduped.length - 1] = pt;
+    }
+  }
+
+  // Anchor the right edge (nowSec) so the line extends across to the current moment:
+  if (deduped.length > 0) {
+    const last = deduped[deduped.length - 1];
+    if (last.time < nowSec) {
+      deduped.push({ time: nowSec, value: last.value });
+    }
+  }
+
+  return deduped;
 }
 
 function validProb(value: unknown): value is number {
