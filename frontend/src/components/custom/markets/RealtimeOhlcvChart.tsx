@@ -299,6 +299,24 @@ export function RealtimeOhlcvChart({
         }, resolution);
       }
 
+      if (droppedForming.length > 0 && aggregatorRef.current) {
+        aggregatorRef.current.seed(droppedForming[0]);
+      } else if (aggregatorRef.current && !aggregatorRef.current.current) {
+        const lastPrice =
+          outcomePrice(usePriceStore.getState().prices[marketId], selectedOutcome) ??
+          completed[completed.length - 1]?.close;
+        if (lastPrice != null && Number.isFinite(lastPrice)) {
+          aggregatorRef.current.seed({
+            time: bucketStartSec,
+            open: lastPrice,
+            high: lastPrice,
+            low: lastPrice,
+            close: lastPrice,
+            volume: 0,
+          });
+        }
+      }
+
       if (token !== tokenRef.current) return null;
       handleRef.current?.setHistory(completed, { fit });
       return completed;

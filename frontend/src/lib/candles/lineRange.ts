@@ -45,7 +45,7 @@ export function lineRangeToWindow(range: LineRange): { from: string; to: string 
   };
 }
 
-function lineRangeMs(range: LineRange): number {
+export function lineRangeMs(range: LineRange): number {
   switch (range) {
     case "1H":
       return HOUR;
@@ -66,10 +66,31 @@ export function linePointsFromCandles(candles: NormalizedCandle[], range: LineRa
   const windowMs = lineRangeMs(range);
   const cutoff = windowMs == null ? null : Math.floor((Date.now() - windowMs) / 1000);
   const points: LinePoint[] = [];
+  let lastBeforeCutoff: NormalizedCandle | null = null;
 
   for (const candle of candles) {
-    if (cutoff != null && candle.time < cutoff) continue;
+    if (cutoff != null && candle.time < cutoff) {
+      if (!lastBeforeCutoff || candle.time > lastBeforeCutoff.time) {
+        lastBeforeCutoff = candle;
+      }
+      continue;
+    }
     points.push({ time: candle.time, value: candle.close });
+  }
+
+  // If we have an earlier candle before the cutoff window:
+  if (cutoff != null && lastBeforeCutoff) {
+    if (points.length > 0 && points[0].time > cutoff) {
+      // Anchor the start of the visible window using the latest candle before cutoff
+      points.unshift({ time: cutoff, value: lastBeforeCutoff.close });
+    } else if (points.length === 0) {
+      // No trades within this window, carry forward the last known price to current time
+      const nowSec = Math.floor(Date.now() / 1000);
+      points.push({ time: cutoff, value: lastBeforeCutoff.close });
+      if (nowSec > cutoff) {
+        points.push({ time: nowSec, value: lastBeforeCutoff.close });
+      }
+    }
   }
 
   return points;

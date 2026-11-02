@@ -615,7 +615,7 @@
   backdrop-filter: blur(4px);
   z-index: 10;
   border-radius: 8px;
-  pointer-events: none;
+  pointer-events: auto;
 }
 
 .chart-empty-message {

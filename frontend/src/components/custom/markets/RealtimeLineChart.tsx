@@ -7,6 +7,7 @@ import { fetchMarketCandles } from "@/hooks/useMarketCandles";
 import {
   linePointsFromCandles,
   linePriceForOutcome,
+  lineRangeMs,
   lineRangeToResolution,
   lineRangeToWindow,
 } from "@/lib/candles/lineRange";
@@ -161,13 +162,30 @@ export function RealtimeLineChart({
           if (livePrice != null) {
             const last = pts[pts.length - 1];
             if (!last) {
-              pts = [{ time: timeSec, value: livePrice }];
+              const windowMs = lineRangeMs(targetRange);
+              const cutoff = windowMs == null ? null : Math.floor((Date.now() - windowMs) / 1000);
+              if (cutoff != null && cutoff < timeSec) {
+                pts = [
+                  { time: cutoff, value: livePrice },
+                  { time: timeSec, value: livePrice },
+                ];
+              } else {
+                pts = [{ time: timeSec, value: livePrice }];
+              }
             } else if (timeSec > last.time) {
               pts = [...pts, { time: timeSec, value: livePrice }];
             } else if (timeSec === last.time) {
               pts = [...pts.slice(0, -1), { time: last.time, value: livePrice }];
             }
           }
+        }
+
+        // If an outcome series has only 1 point, synthesize a start point so lightweight-charts can render a line segment
+        if (pts.length === 1) {
+          const windowMs = lineRangeMs(targetRange);
+          const cutoff = windowMs == null ? null : Math.floor((Date.now() - windowMs) / 1000);
+          const start = cutoff != null && cutoff < pts[0].time ? cutoff : pts[0].time - 60;
+          pts = [{ time: start, value: pts[0].value }, pts[0]];
         }
 
         if (pts.length > 0) {
@@ -201,6 +219,12 @@ export function RealtimeLineChart({
     if (!historyReadyRef.current || isNewMarket) {
       historyReadyRef.current = false;
       setStatus("loading");
+      // Clear chart canvas immediately on new market so previous market's series aren't visible
+      void chartReadyRef.current.then((handle) => {
+        if (handle && token === tokenRef.current) {
+          handle.setHistory([]);
+        }
+      });
     }
 
     const cfg = configRef.current;
@@ -211,7 +235,7 @@ export function RealtimeLineChart({
 
     const loadHistory = async () => {
       try {
-        const entries = await Promise.all(
+        let entries = await Promise.all(
           [...ids].map(async (id) => {
             const rows = await fetchMarketCandles(marketId, lineResolution, {
               outcome: id,
@@ -225,12 +249,43 @@ export function RealtimeLineChart({
 
         if (token !== tokenRef.current) return;
 
-        const candlesMap = new Map(entries);
-        const hasRows = [...candlesMap.values()].some((rows) => rows.length > 0);
+        let candlesMap = new Map(entries);
+        let hasRows = [...candlesMap.values()].some((rows) => rows.length > 0);
 
-        if (!hasRows) {
-          setStatus("empty");
-          return;
+        // Fallback 1: If 1m resolution has no candles (e.g. Kalshi only stores 5m+),
+        // fallback to 5m resolution within the same time window.
+        if (!hasRows && lineResolution === "1m") {
+          entries = await Promise.all(
+            [...ids].map(async (id) => {
+              const rows = await fetchMarketCandles(marketId, "5m", {
+                outcome: id,
+                stored: true,
+                from,
+                to,
+              });
+              return [id, rows] as const;
+            })
+          );
+          if (token !== tokenRef.current) return;
+          candlesMap = new Map(entries);
+          hasRows = [...candlesMap.values()].some((rows) => rows.length > 0);
+        }
+
+        // Fallback 2: If still no rows within the restricted time window (from..to),
+        // fetch stored candles without from/to so earlier history can anchor the line across this window.
+        if (!hasRows && (range === "1H" || range === "6H")) {
+          entries = await Promise.all(
+            [...ids].map(async (id) => {
+              const rows = await fetchMarketCandles(marketId, "5m", {
+                outcome: id,
+                stored: true,
+              });
+              return [id, rows] as const;
+            })
+          );
+          if (token !== tokenRef.current) return;
+          candlesMap = new Map(entries);
+          hasRows = [...candlesMap.values()].some((rows) => rows.length > 0);
         }
 
         const seriesList = buildSeriesList(
@@ -240,13 +295,17 @@ export function RealtimeLineChart({
           cfg.outcomes,
           binary
         );
-        if (!seriesList.length) {
+
+        const hasAnyPoints = seriesList.some((s) => s.points.length > 0);
+        const handle = await chartReadyRef.current;
+        if (token !== tokenRef.current || !handle) return;
+
+        if (!hasAnyPoints) {
+          handle.setHistory([]);
+          historyReadyRef.current = false;
           setStatus("empty");
           return;
         }
-
-        const handle = await chartReadyRef.current;
-        if (token !== tokenRef.current || !handle) return;
 
         // Fit content ONLY on initial market load or when user changed the time range button.
         // If user already zoomed in, preserve their exact zoom/pan viewport!
@@ -257,6 +316,11 @@ export function RealtimeLineChart({
       } catch (err) {
         if (token !== tokenRef.current) return;
         console.error("[RealtimeLineChart] Failed to load history:", err);
+        const handle = await chartReadyRef.current;
+        if (handle && token === tokenRef.current) {
+          handle.setHistory([]);
+        }
+        historyReadyRef.current = false;
         setStatus("error");
       }
     };
@@ -328,7 +392,7 @@ export function RealtimeLineChart({
       if (cfg.binary && ids.has(1)) ids.add(0);
 
       try {
-        const entries = await Promise.all(
+        let entries = await Promise.all(
           [...ids].map(async (id) => {
             const rows = await fetchMarketCandles(cfg.marketId, lineResolution, {
               outcome: id,
@@ -339,8 +403,24 @@ export function RealtimeLineChart({
             return [id, rows] as const;
           })
         );
+        let candlesMap = new Map(entries);
+        let hasRows = [...candlesMap.values()].some((rows) => rows.length > 0);
+        if (!hasRows && lineResolution === "1m") {
+          entries = await Promise.all(
+            [...ids].map(async (id) => {
+              const rows = await fetchMarketCandles(cfg.marketId, "5m", {
+                outcome: id,
+                stored: true,
+                from,
+                to,
+              });
+              return [id, rows] as const;
+            })
+          );
+          candlesMap = new Map(entries);
+        }
         const seriesList = buildSeriesList(
-          new Map(entries),
+          candlesMap,
           cfg.range,
           cfg.visibleIds,
           cfg.outcomes,
