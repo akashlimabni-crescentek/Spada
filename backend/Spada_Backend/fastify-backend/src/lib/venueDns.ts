@@ -22,7 +22,7 @@ function isVenueHost(hostname: string): boolean {
   );
 }
 
-export const venueLookup: dns.LookupFunction = (hostname, options, callback) => {
+export const venueLookup = (hostname: string, options: any, callback?: any) => {
   const opts: dns.LookupOptions = typeof options === 'function' ? {} : options;
   const done = (typeof options === 'function' ? options : callback) as (
     err: NodeJS.ErrnoException | null,
@@ -57,4 +57,4 @@ export const venueLookup: dns.LookupFunction = (hostname, options, callback) => 
 };
 
 // fetch() and the `ws` client both call dns.lookup when they connect.
-dns.lookup = venueLookup;
+dns.lookup = venueLookup as unknown as typeof dns.lookup;

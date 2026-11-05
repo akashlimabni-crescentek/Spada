@@ -173,7 +173,16 @@ export function matchText(
 }
 
 function sideTokens(side: string): Set<string> {
-  return new Set(titleTokens(side));
+  const significant = titleTokens(side);
+  if (significant.length > 0) return new Set(significant);
+  return new Set(
+    side
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, ' ')
+      .split(/[\s-]+/)
+      .map((t) => t.trim())
+      .filter((t) => t.length >= 1)
+  );
 }
 
 function sideOverlapCount(a: string, b: string): number {
@@ -210,9 +219,170 @@ export function parseBinarySides(
   return null;
 }
 
+export type OutcomeRelation = 'equivalent' | 'opposite' | 'ambiguous';
+
+function isOverText(text: string): boolean {
+  return /\b(over|above|more than|greater than)\b/i.test(text);
+}
+
+function isUnderText(text: string): boolean {
+  return /\b(under|below|less than|fewer than)\b/i.test(text);
+}
+
+function hasNegationWord(text: string): boolean {
+  return /\b(not|won't|will not|fail|fails|cancelled|cancel)\b/i.test(text);
+}
+
+function isNoiseLabel(label: string): boolean {
+  const t = label.trim().toLowerCase();
+  return (
+    !t ||
+    t === 'yes' ||
+    t === 'no' ||
+    /^\d[\d,.\s%+]*$/.test(t) ||
+    /^[↑↓]/.test(t)
+  );
+}
+
+/**
+ * Determine outcome equivalence using semantic labels, side tokens, and market structure.
+ * Never uses probability proximity to guess inversion.
+ */
+export function determineOutcomeRelation(
+  sourceTitle: string | null | undefined,
+  sourceOutcome: string | null | undefined,
+  twinTitle: string | null | undefined,
+  twinOutcome: string | null | undefined
+): OutcomeRelation {
+  const sTitle = (sourceTitle || '').trim();
+  const tTitle = (twinTitle || '').trim();
+  const sOut = (sourceOutcome || '').trim().toLowerCase();
+  const tOut = (twinOutcome || '').trim().toLowerCase();
+
+  const sText = `${sTitle} ${sourceOutcome || ''}`.trim();
+  const tText = `${tTitle} ${twinOutcome || ''}`.trim();
+
+  // 1. Over / Under totals / props
+  const sOver = isOverText(sText);
+  const sUnder = isUnderText(sText);
+  const tOver = isOverText(tText);
+  const tUnder = isUnderText(tText);
+
+  if ((sOver || sUnder) && (tOver || tUnder)) {
+    if (sOver && tOver) return 'equivalent';
+    if (sUnder && tUnder) return 'equivalent';
+    if ((sOver && tUnder) || (sUnder && tOver)) return 'opposite';
+    return 'ambiguous';
+  }
+
+  // 2. Direct YES/NO outcome polarity
+  const sIsYes = sOut === 'yes' || sOut === 'y';
+  const sIsNo = sOut === 'no' || sOut === 'n';
+  const tIsYes = tOut === 'yes' || tOut === 'y';
+  const tIsNo = tOut === 'no' || tOut === 'n';
+
+  if ((sIsYes || sIsNo) && (tIsYes || tIsNo)) {
+    const sNeg = hasNegationWord(sTitle);
+    const tNeg = hasNegationWord(tTitle);
+    const titleNegMismatch = sNeg !== tNeg;
+
+    if (sIsYes && tIsYes) return titleNegMismatch ? 'opposite' : 'equivalent';
+    if (sIsNo && tIsNo) return titleNegMismatch ? 'opposite' : 'equivalent';
+    if ((sIsYes && tIsNo) || (sIsNo && tIsYes)) {
+      return titleNegMismatch ? 'equivalent' : 'opposite';
+    }
+  }
+
+  // 3. Binary matchups ("A vs B" / "A / B")
+  const sSides = parseBinarySides(sTitle, sourceOutcome);
+  const tSides = parseBinarySides(tTitle, twinOutcome);
+  const matchupSides = sSides || tSides;
+
+  if (matchupSides) {
+    const [sideA, sideB] = matchupSides;
+
+    // Determine which side source is for
+    let sSide: 'A' | 'B' | null = null;
+    const sTarget = sourceOutcome || sTitle;
+    const sScoreA = sideOverlapCount(sTarget, sideA);
+    const sScoreB = sideOverlapCount(sTarget, sideB);
+    if (sScoreA > sScoreB) sSide = 'A';
+    else if (sScoreB > sScoreA) sSide = 'B';
+
+    // Determine which side twin is for
+    let tSide: 'A' | 'B' | null = null;
+    if (twinOutcome && twinOutcome.includes('/')) {
+      // In "A / B" notation, the YES contract is for sideA
+      const parts = twinOutcome.split(/\s*\/\s*/).map((s) => s.trim()).filter(Boolean);
+      if (parts.length >= 2) {
+        const pScoreA = sideOverlapCount(parts[0], sideA);
+        const pScoreB = sideOverlapCount(parts[0], sideB);
+        tSide = pScoreA >= pScoreB ? 'A' : 'B';
+      }
+    } else {
+      const tTarget = twinOutcome || tTitle;
+      const tScoreA = sideOverlapCount(tTarget, sideA);
+      const tScoreB = sideOverlapCount(tTarget, sideB);
+      if (tScoreA > tScoreB) tSide = 'A';
+      else if (tScoreB > tScoreA) tSide = 'B';
+    }
+
+    if (sSide && tSide) {
+      return sSide === tSide ? 'equivalent' : 'opposite';
+    }
+
+    if (!sSide && !tSide && sSides && tSides) {
+      // Both markets are titled "A vs B" with identical primary/secondary order and no outcome labels
+      const sameOrder =
+        sideOverlapCount(sSides[0], tSides[0]) > 0 &&
+        sideOverlapCount(sSides[1], tSides[1]) > 0;
+      if (sameOrder) return 'equivalent';
+    }
+
+    // Direct overlap between source outcome and twin outcome labels
+    if (sourceOutcome && twinOutcome) {
+      const directHits = sideOverlapCount(sourceOutcome, twinOutcome);
+      if (directHits > 0) return 'equivalent';
+    }
+
+    // If it's a binary matchup but sides cannot be distinguished with confidence
+    if ((sScoreA > 0 || sScoreB > 0) !== (tSide != null)) {
+      return 'ambiguous';
+    }
+  }
+
+  // 4. Non-noise entity labels (Tournament winner / Multi-candidate participants)
+  if (sourceOutcome && twinOutcome && !isNoiseLabel(sourceOutcome) && !isNoiseLabel(twinOutcome)) {
+    if (sOut === tOut) return 'equivalent';
+    const overlap = sideOverlapCount(sourceOutcome, twinOutcome);
+    if (overlap >= 2) return 'equivalent';
+    return 'ambiguous';
+  }
+
+  // 5. Binary proposition markets without "vs" or "o/u" (e.g. "Will X happen?")
+  const sNeg = hasNegationWord(sTitle);
+  const tNeg = hasNegationWord(tTitle);
+  if (sNeg !== tNeg) {
+    return 'opposite';
+  }
+
+  // If one side has an outcome label naming an entity not found in the other, treat as ambiguous
+  if (sourceOutcome && !twinOutcome && !isNoiseLabel(sourceOutcome)) {
+    const hits = sideOverlapCount(sourceOutcome, tTitle);
+    if (hits === 0) return 'ambiguous';
+  }
+  if (twinOutcome && !sourceOutcome && !isNoiseLabel(twinOutcome)) {
+    const hits = sideOverlapCount(twinOutcome, sTitle);
+    if (hits === 0) return 'ambiguous';
+  }
+
+  return 'equivalent';
+}
+
 /**
  * Align twin price to the source outcome.
- * Prefer the orientation (p or 1−p) closest to the source probability when known.
+ * Returns null if outcome alignment cannot be established with confidence.
+ * Never uses probability numerical proximity as an inversion deciding factor.
  */
 export function alignTwinPrice(
   sourceTitle: string | null | undefined,
@@ -220,32 +390,28 @@ export function alignTwinPrice(
   twinTitle: string | null | undefined,
   twinOutcome: string | null | undefined,
   twinPrice: number,
-  sourceProb?: number | null
-): number {
-  if (!Number.isFinite(twinPrice)) return twinPrice;
-
-  if (sourceProb != null && Number.isFinite(sourceProb)) {
-    const inv = 1 - twinPrice;
-    return Math.abs(sourceProb - twinPrice) <= Math.abs(sourceProb - inv)
-      ? twinPrice
-      : inv;
+  _deprecatedSourceProb?: number | null
+): number | null {
+  if (!Number.isFinite(twinPrice) || twinPrice < 0 || twinPrice > 1) {
+    return null;
   }
 
-  const sourceSide = (sourceOutcome || '').trim();
-  if (!sourceSide) return twinPrice;
+  const relation = determineOutcomeRelation(
+    sourceTitle,
+    sourceOutcome,
+    twinTitle,
+    twinOutcome
+  );
 
-  const twinSides = parseBinarySides(twinTitle, twinOutcome);
-  if (!twinSides) return twinPrice;
-
-  const [primary, secondary] = twinSides;
-  const primaryHits = sideOverlapCount(sourceSide, primary);
-  const secondaryHits = sideOverlapCount(sourceSide, secondary);
-
-  // Prefer the side with stronger token overlap (handles shared tokens like "team").
-  if (secondaryHits > primaryHits) {
+  if (relation === 'equivalent') {
+    return twinPrice;
+  }
+  if (relation === 'opposite') {
     return 1 - twinPrice;
   }
-  return twinPrice;
+
+  // Ambiguous: return null
+  return null;
 }
 
 export function pickProb(...vals: Array<number | null | undefined>): number | null {

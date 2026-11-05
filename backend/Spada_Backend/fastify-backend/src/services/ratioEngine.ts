@@ -5,8 +5,13 @@ import {
   closesInWindow,
   computeRatios,
   daysUntilClose,
+  DEFAULT_MAX_QUOTE_AGE_MS,
+  DEFAULT_MAX_QUOTE_DIFF_MS,
   explainRatioSkips,
+  parseSourceTimestampMs,
+  validateQuoteFreshness,
   type MarketRatios,
+  type QuoteFreshnessState,
   type RatioSkipMap,
 } from '../lib/ratios.js';
 import {
@@ -22,11 +27,12 @@ import {
   extractPolymarketStats,
   type ProviderMarketStats,
 } from '../lib/providerStats.js';
-import { readLiveQuote } from '../lib/liveQuotes.js';
+import { readLiveQuote, readLiveQuoteRecord } from '../lib/liveQuotes.js';
 import { orderbookStore } from './orderbookStore.js';
 import { candleAggregator } from './candleAggregator.js';
 import {
   alignTwinReliableProb,
+  isMarketClosedOrExpired,
   marketReliableProb,
   resolveCrossPlatformMatch,
   runMarketMatchSyncDetailed,
@@ -65,6 +71,9 @@ export type RatioComputationResult = {
     prob24hAgo: number | null;
     polyProb: number | null;
     kalshiProb: number | null;
+    polyProbTs?: number | null;
+    kalshiProbTs?: number | null;
+    quoteFreshness?: QuoteFreshnessState | null;
     daysToClose: number | null;
     closes7dCount: number;
     matchFromCache: boolean;
@@ -217,28 +226,30 @@ export async function fetchBestBidAsk(market: RatioMarketRow): Promise<{
   bid: number | null;
   ask: number | null;
   kalshiOrderbook: Record<string, unknown> | null;
+  timestamp: string | null;
 }> {
   try {
     const book = await orderbookStore.getOrderbook(market.canonical_id);
+    const ts = typeof (book as any)?.timestamp === 'string' ? (book as any).timestamp : null;
     if (market.platform === 'polymarket') {
       const normalized = polyToBook(
         parseBookLevels((book as any).bids),
         parseBookLevels((book as any).asks)
       );
       const ba = bestBidAskFromNormalized(normalized);
-      return { ...ba, kalshiOrderbook: null };
+      return { ...ba, kalshiOrderbook: null, timestamp: ts };
     }
     if (market.platform === 'kalshi') {
       const ob = ((book as any).orderbook ?? {}) as Record<string, unknown>;
       const { yesBids, noBids } = extractKalshiYesNoBids(ob);
       const normalized = kalshiToYesBook(yesBids, noBids);
       const ba = bestBidAskFromNormalized(normalized);
-      return { ...ba, kalshiOrderbook: ob };
+      return { ...ba, kalshiOrderbook: ob, timestamp: ts };
     }
   } catch (err: any) {
     console.warn('[ratioEngine] orderbook failed:', err?.message ?? err);
   }
-  return { bid: null, ask: null, kalshiOrderbook: null };
+  return { bid: null, ask: null, kalshiOrderbook: null, timestamp: null };
 }
 
 const RATIO_HEAVY_TTL_MS = 5_000;
@@ -247,6 +258,7 @@ type RatioBook = {
   bid: number | null;
   ask: number | null;
   kalshiOrderbook: Record<string, unknown> | null;
+  timestamp?: string | null;
 };
 
 type RatioCandleRow = { ts: string; close: number; volume: number };
@@ -260,6 +272,7 @@ type RatioHeavySnapshot = {
     match: CrossPlatformMatch;
     bid: number | null;
     ask: number | null;
+    timestamp?: string | null;
   } | null;
 };
 
@@ -271,6 +284,7 @@ export type RatioEngineDeps = {
     bid: number | null;
     ask: number | null;
     kalshiOrderbook: Record<string, unknown> | null;
+    timestamp?: string | null;
   }>;
   getCandlesSince?: (
     canonicalId: string,
@@ -337,7 +351,7 @@ export async function computeMarketRatios(
       storedYesPrice(market),
       book.bid,
       book.ask,
-      readLiveQuote(market.canonical_id)?.[0]
+      readLiveQuoteRecord(market.canonical_id)?.prices?.[0]
     );
     const crossMatch = await resolveMatch(market, seedProb);
     if (crossMatch) {
@@ -346,6 +360,7 @@ export async function computeMarketRatios(
         match: crossMatch,
         bid: twinBook.bid,
         ask: twinBook.ask,
+        timestamp: twinBook.timestamp ?? null,
       };
     }
 
@@ -362,31 +377,51 @@ export async function computeMarketRatios(
 
   const bestBid = book.bid;
   const bestAsk = book.ask;
+  const primaryLiveRec = readLiveQuoteRecord(market.canonical_id);
+  const primaryLiveYes = validLiveYes(primaryLiveRec?.prices?.[0]);
   const resolvedCurrentProb = assembleCurrentProb(
     storedYesPrice(market),
     bestBid,
     bestAsk,
-    readLiveQuote(market.canonical_id)?.[0]
+    primaryLiveYes
   );
+
+  let primaryTs: number | null = null;
+  if (primaryLiveYes != null) {
+    primaryTs = primaryLiveRec?.sourceTs ?? null;
+  }
 
   let crossMatch: CrossPlatformMatch | null = twinSnap
     ? { ...twinSnap.match }
     : null;
 
+  let twinTs: number | null = null;
   // Twin divergence prob: live quote when present, else pickReliableProb, then alignTwinPrice.
   if (crossMatch && twinSnap) {
+    const twinLiveRec = readLiveQuoteRecord(crossMatch.twin.canonical_id);
+    const twinLiveYes = validLiveYes(twinLiveRec?.prices?.[0]);
+
     const aligned = assembleAlignedTwinProb(
       market,
       crossMatch.twin,
       twinSnap.bid,
       twinSnap.ask,
       resolvedCurrentProb,
-      readLiveQuote(crossMatch.twin.canonical_id)?.[0]
+      twinLiveYes
     );
     if (aligned != null) {
       crossMatch = { ...crossMatch, alignedTwinProb: aligned };
+      if (twinLiveYes != null) {
+        twinTs = twinLiveRec?.sourceTs ?? null;
+      }
+    } else {
+      crossMatch = { ...crossMatch, alignedTwinProb: null };
     }
   }
+
+  const isPrimaryClosedOrExpired = isMarketClosedOrExpired(market, now);
+  const isTwinClosedOrExpired = crossMatch ? isMarketClosedOrExpired(crossMatch.twin, now) : false;
+  const isClosedOrExpired = isPrimaryClosedOrExpired || isTwinClosedOrExpired;
 
   // POC: provider/API volume → 5m candle sum (no markets.volume DB fallback)
   const vol24h = assembleVol24h(stats?.volume_24h, candleRows, now);
@@ -407,13 +442,33 @@ export async function computeMarketRatios(
 
   let polyProb: number | null = null;
   let kalshiProb: number | null = null;
+  let polyProbTs: number | null = null;
+  let kalshiProbTs: number | null = null;
+
   if (market.platform === 'polymarket') {
     polyProb = resolvedCurrentProb;
     kalshiProb = crossMatch?.alignedTwinProb ?? null;
+    polyProbTs = primaryTs;
+    kalshiProbTs = crossMatch ? twinTs : null;
   } else if (market.platform === 'kalshi') {
     kalshiProb = resolvedCurrentProb;
     polyProb = crossMatch?.alignedTwinProb ?? null;
+    kalshiProbTs = primaryTs;
+    polyProbTs = crossMatch ? twinTs : null;
   }
+
+  // Only pass timestamps to computeRatios when BOTH are present from live socket quotes.
+  // A single-sided live ts paired with null causes missing_quote_timestamp and blocks divergence.
+  // When neither or only one side has a live exchange ts, skip freshness gating entirely so
+  // divergence can be computed from stored DB prices.
+  const hasBothTs = polyProbTs != null && kalshiProbTs != null;
+
+  const freshness =
+    polyProb != null && kalshiProb != null
+      ? hasBothTs
+        ? validateQuoteFreshness(polyProbTs, kalshiProbTs, now)
+        : { valid: true, state: 'live' as QuoteFreshnessState }
+      : { valid: false, state: 'unavailable' as QuoteFreshnessState };
 
   const ratioInput = {
     vol24h,
@@ -425,6 +480,11 @@ export async function computeMarketRatios(
     prob24hAgo,
     polyProb,
     kalshiProb,
+    // Only forward timestamps when BOTH are present so ratios.ts freshness gate is not triggered on one-sided ts
+    polyProbTs: hasBothTs ? polyProbTs : undefined,
+    kalshiProbTs: hasBothTs ? kalshiProbTs : undefined,
+    isClosedOrExpired,
+    nowMs: now,
     daysToClose,
     closes7d,
   };
@@ -443,7 +503,16 @@ export async function computeMarketRatios(
   let legacyRatio: number | null = null;
   let legacySpread: number | null = null;
   let legacyDivergencePct: number | null = null;
-  if (primaryYes != null && counterYes != null && counterYes > 0) {
+  // Require both prices >= 0.01: near-zero prices indicate a resolved/expired market
+  // and produce extreme legacy values (e.g. -99.92, 119900) via division by tiny counterYes.
+  if (
+    !isClosedOrExpired &&
+    freshness.valid &&
+    primaryYes != null &&
+    counterYes != null &&
+    primaryYes >= 0.01 &&
+    counterYes >= 0.01
+  ) {
     legacyRatio = Number((primaryYes / counterYes).toFixed(4));
     legacySpread = Number((primaryYes - counterYes).toFixed(4));
     legacyDivergencePct = Number(
@@ -478,6 +547,9 @@ export async function computeMarketRatios(
       prob24hAgo,
       polyProb,
       kalshiProb,
+      polyProbTs,
+      kalshiProbTs,
+      quoteFreshness: freshness.state,
       daysToClose,
       closes7dCount: closes7d.length,
       matchFromCache: Boolean(crossMatch?.fromCache),
@@ -512,6 +584,7 @@ export function buildRatioHttpResponse(
       divergence_percent: result.legacy.divergence_percent,
     },
     inputs: result.inputs,
+    ratioSkips: result.ratioSkips,
     primaryMarket: {
       canonical_id: market.canonical_id,
       platform: market.platform,

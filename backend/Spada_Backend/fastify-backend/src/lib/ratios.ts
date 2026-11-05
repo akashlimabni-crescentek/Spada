@@ -21,6 +21,143 @@ export type MarketRatios = {
   resolutionTension: number | null;
 };
 
+export const DEFAULT_MAX_QUOTE_AGE_MS = 60_000;
+export const DEFAULT_MAX_QUOTE_DIFF_MS = 30_000;
+export const MAX_FUTURE_QUOTE_TOLERANCE_MS = 5_000;
+
+export type QuoteFreshnessState = 'live' | 'stale' | 'unavailable';
+
+export interface QuoteFreshnessResult {
+  valid: boolean;
+  state: QuoteFreshnessState;
+  reason?:
+    | 'missing_quote_timestamp'
+    | 'invalid_quote_timestamp'
+    | 'future_quote_timestamp'
+    | 'stale_quote'
+    | 'cross_venue_timestamp_divergence';
+  polyAgeMs?: number;
+  kalshiAgeMs?: number;
+  diffMs?: number;
+}
+
+/**
+ * Normalizes exchange-provided timestamps from Polymarket and Kalshi to Unix milliseconds.
+ * Supports:
+ *   - Unix seconds (< 1e11)
+ *   - Unix milliseconds (1e11 <= n < 1e14)
+ *   - Unix microseconds (1e14 <= n < 1e17)
+ *   - Unix nanoseconds (>= 1e17)
+ *   - Pure numeric strings of the above scales
+ *   - ISO 8601 date strings
+ *   - Date objects
+ * Returns null for missing, non-positive, non-finite, or unparseable inputs.
+ * Never fabricates or returns current backend time.
+ */
+export function parseSourceTimestampMs(raw: unknown): number | null {
+  if (raw == null) return null;
+  if (raw instanceof Date) {
+    const t = raw.getTime();
+    return Number.isFinite(t) && t > 0 ? t : null;
+  }
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw) || raw <= 0) return null;
+    if (raw < 1e11) return Math.round(raw * 1000);
+    if (raw < 1e14) return Math.round(raw);
+    if (raw < 1e17) return Math.round(raw / 1000);
+    return Math.round(raw / 1_000_000);
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const asNum = Number(trimmed);
+    if (Number.isFinite(asNum) && asNum > 0) {
+      if (asNum < 1e11) return Math.round(asNum * 1000);
+      if (asNum < 1e14) return Math.round(asNum);
+      if (asNum < 1e17) return Math.round(asNum / 1000);
+      return Math.round(asNum / 1_000_000);
+    }
+    const parsed = Date.parse(trimmed);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+  return null;
+}
+
+export function validateQuoteFreshness(
+  polyTs: number | null | undefined,
+  kalshiTs: number | null | undefined,
+  nowMs: number = Date.now(),
+  maxAgeMs: number = DEFAULT_MAX_QUOTE_AGE_MS,
+  maxDiffMs: number = DEFAULT_MAX_QUOTE_DIFF_MS
+): QuoteFreshnessResult {
+  if (polyTs == null || kalshiTs == null) {
+    return {
+      valid: false,
+      state: 'unavailable',
+      reason: 'missing_quote_timestamp',
+    };
+  }
+
+  if (
+    !Number.isFinite(polyTs) ||
+    !Number.isFinite(kalshiTs) ||
+    polyTs <= 0 ||
+    kalshiTs <= 0
+  ) {
+    return {
+      valid: false,
+      state: 'unavailable',
+      reason: 'invalid_quote_timestamp',
+    };
+  }
+
+  // Reject timestamps more than 5,000 milliseconds into the future
+  if (
+    polyTs - nowMs > MAX_FUTURE_QUOTE_TOLERANCE_MS ||
+    kalshiTs - nowMs > MAX_FUTURE_QUOTE_TOLERANCE_MS
+  ) {
+    return {
+      valid: false,
+      state: 'stale',
+      reason: 'future_quote_timestamp',
+    };
+  }
+
+  const polyAgeMs = Math.max(0, nowMs - polyTs);
+  const kalshiAgeMs = Math.max(0, nowMs - kalshiTs);
+  const diffMs = Math.abs(polyTs - kalshiTs);
+
+  if (polyAgeMs > maxAgeMs || kalshiAgeMs > maxAgeMs) {
+    return {
+      valid: false,
+      state: 'stale',
+      reason: 'stale_quote',
+      polyAgeMs,
+      kalshiAgeMs,
+      diffMs,
+    };
+  }
+
+  if (diffMs > maxDiffMs) {
+    return {
+      valid: false,
+      state: 'stale',
+      reason: 'cross_venue_timestamp_divergence',
+      polyAgeMs,
+      kalshiAgeMs,
+      diffMs,
+    };
+  }
+
+  return {
+    valid: true,
+    state: 'live',
+    polyAgeMs,
+    kalshiAgeMs,
+    diffMs,
+  };
+}
+
 export type RatioInputs = {
   vol24h: number | null;
   liquidity: number | null;
@@ -31,6 +168,12 @@ export type RatioInputs = {
   prob24hAgo: number | null;
   polyProb: number | null;
   kalshiProb: number | null;
+  polyProbTs?: number | null;
+  kalshiProbTs?: number | null;
+  maxQuoteAgeMs?: number;
+  maxQuoteDiffMs?: number;
+  isClosedOrExpired?: boolean;
+  nowMs?: number;
   daysToClose: number | null;
   closes7d: number[];
 };
@@ -168,6 +311,19 @@ export function explainRatioSkips(input: RatioInputs): RatioSkipMap {
     skips.divergence = 'missing_or_invalid_cross_venue_prob';
   } else if ((poly + kalshi) / 2 === 0) {
     skips.divergence = 'zero_mean_prob';
+  } else if (input.isClosedOrExpired === true || (input.daysToClose != null && input.daysToClose <= 0)) {
+    skips.divergence = 'market_expired_or_closed';
+  } else if (input.polyProbTs !== undefined || input.kalshiProbTs !== undefined) {
+    const freshness = validateQuoteFreshness(
+      input.polyProbTs,
+      input.kalshiProbTs,
+      input.nowMs ?? Date.now(),
+      input.maxQuoteAgeMs ?? DEFAULT_MAX_QUOTE_AGE_MS,
+      input.maxQuoteDiffMs ?? DEFAULT_MAX_QUOTE_DIFF_MS
+    );
+    if (!freshness.valid && freshness.reason) {
+      skips.divergence = freshness.reason;
+    }
   }
 
   if (validProb(input.currentProb) == null || validProb(input.prob24hAgo) == null) {
@@ -222,8 +378,26 @@ export function computeRatios(input: RatioInputs): MarketRatios {
   const resolutionTension =
     stddev7d != null && days != null ? finiteOrNull(stddev7d * days) : null;
 
+  // Expiration check: if market is expired/closed, divergence is null
+  const isExpired =
+    input.isClosedOrExpired === true ||
+    (days != null && days <= 0);
+
+  // Freshness check: if quote timestamps are provided, validate age & diff
+  const hasTimestamps =
+    input.polyProbTs !== undefined || input.kalshiProbTs !== undefined;
+  const freshness = hasTimestamps
+    ? validateQuoteFreshness(
+        input.polyProbTs,
+        input.kalshiProbTs,
+        input.nowMs ?? Date.now(),
+        input.maxQuoteAgeMs ?? DEFAULT_MAX_QUOTE_AGE_MS,
+        input.maxQuoteDiffMs ?? DEFAULT_MAX_QUOTE_DIFF_MS
+      )
+    : { valid: true };
+
   const divergence =
-    poly != null && kalshi != null
+    poly != null && kalshi != null && !isExpired && freshness.valid
       ? safeDiv(Math.abs(poly - kalshi), (poly + kalshi) / 2)
       : null;
 

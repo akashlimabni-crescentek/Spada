@@ -587,6 +587,44 @@ async function saveMarkets(markets: StandardizedMarket[]): Promise<number> {
   return written;
 }
 
+/**
+ * Mark markets as inactive when their close_time / expiration_time has passed.
+ * Runs at the end of every sync cycle so divergence never uses a stale twin.
+ */
+async function deactivateExpiredMarkets(): Promise<number> {
+  const now = new Date().toISOString();
+  let total = 0;
+
+  const { data: byClose, error: e1 } = await supabaseAdmin
+    .from('markets')
+    .update({ active: false })
+    .eq('active', true)
+    .lt('raw_data->>close_time', now)
+    .select('canonical_id');
+  if (e1) console.warn('[Sync Worker] expiry sweep (close_time):', formatSupabaseError(e1));
+  else total += byClose?.length ?? 0;
+
+  const { data: byExp, error: e2 } = await supabaseAdmin
+    .from('markets')
+    .update({ active: false })
+    .eq('active', true)
+    .lt('raw_data->>expiration_time', now)
+    .select('canonical_id');
+  if (e2) console.warn('[Sync Worker] expiry sweep (expiration_time):', formatSupabaseError(e2));
+  else total += byExp?.length ?? 0;
+
+  const { data: byEnd, error: e3 } = await supabaseAdmin
+    .from('markets')
+    .update({ active: false })
+    .eq('active', true)
+    .lt('raw_data->>end_date', now)
+    .select('canonical_id');
+  if (e3) console.warn('[Sync Worker] expiry sweep (end_date):', formatSupabaseError(e3));
+  else total += byEnd?.length ?? 0;
+
+  return total;
+}
+
 let isSyncRunning = false;
 
 export async function runMarketSync(): Promise<void> {
@@ -624,6 +662,11 @@ export async function runMarketSync(): Promise<void> {
     console.log(`[Sync Worker] Total markets collected this cycle: ${allMarkets.length}. Saving to Supabase...`);
 
     const written = await saveMarkets(allMarkets);
+
+    const deactivated = await deactivateExpiredMarkets();
+    if (deactivated > 0) {
+      console.log(`[Sync Worker] Expiry sweep: marked ${deactivated} markets as inactive.`);
+    }
 
     const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
     const nextRun = new Date(Date.now() + 60 * 60 * 1000);

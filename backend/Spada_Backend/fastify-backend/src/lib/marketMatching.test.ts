@@ -78,6 +78,8 @@ function run() {
   const partial = titleMatchScore('Bitcoin above threshold', 'Bitcoin price on Oct 10, 2026?');
   assert.ok(partial < CROSS_MATCH_THRESHOLD, `partial bitcoin overlap: ${partial}`);
 
+  const futureIso = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
   // --- Valid binary moneyline match via findBestTwin ---
   const poly = market({
     canonical_id: 'polymarket_0xabc',
@@ -85,7 +87,7 @@ function run() {
     external_id: '0xabc',
     title: 'Dota 2: BetBoom Team vs OG - Game 2 Winner',
     prices: [0.62, 0.38],
-    raw_data: { end_date: '2026-10-08T14:00:00Z' },
+    raw_data: { end_date: futureIso },
   });
   const kalshiTwin = market({
     canonical_id: 'kalshi_KXBB',
@@ -94,7 +96,7 @@ function run() {
     title: 'BetBoom Team wins',
     prices: [0.6, 0.4],
     raw_data: {
-      close_time: '2026-10-08T14:30:00Z',
+      close_time: futureIso,
       yes_sub_title: 'BetBoom Team',
     },
   });
@@ -104,7 +106,7 @@ function run() {
     external_id: 'OTHER',
     title: 'Completely Unrelated Election Market',
     prices: [0.5, 0.5],
-    raw_data: { close_time: '2026-10-08T14:30:00Z' },
+    raw_data: { close_time: futureIso },
   });
 
   const match = findBestTwin(poly, [kalshiTwin, unrelated], 0.62);
@@ -122,9 +124,10 @@ function run() {
     0.7,
     null
   );
-  assert.ok(Math.abs(inverted - 0.3) < 1e-9, `expected inverted 0.3 got ${inverted}`);
+  assert.ok(Math.abs((inverted as number) - 0.3) < 1e-9, `expected inverted 0.3 got ${inverted}`);
 
-  const alignedByProb = alignTwinPrice(
+  // Equivalent title retains twin price
+  const equivPrice = alignTwinPrice(
     'Will X happen?',
     null,
     'Will X happen?',
@@ -132,7 +135,18 @@ function run() {
     0.2,
     0.75
   );
-  assert.ok(Math.abs(alignedByProb - 0.8) < 1e-9, `prob-aligned invert ${alignedByProb}`);
+  assert.equal(equivPrice, 0.2, 'equivalent title retains twin price');
+
+  // Opposite/negated title inverts twin price
+  const oppPrice = alignTwinPrice(
+    'Will X happen?',
+    'YES',
+    'Will X not happen?',
+    'YES',
+    0.2,
+    0.75
+  );
+  assert.ok(oppPrice != null && Math.abs(oppPrice - 0.8) < 1e-9, `oppPrice ${oppPrice}`);
 
   // --- Different resolution criteria (prop vs moneyline) ---
   const prop = market({
@@ -141,7 +155,7 @@ function run() {
     external_id: 'PROP',
     title: 'Will over 2.5 maps be played in the BetBoom Team vs. 9z CS2 match?',
     prices: [0.4, 0.6],
-    raw_data: { close_time: '2026-10-08T14:30:00Z' },
+    raw_data: { close_time: futureIso },
   });
   assert.equal(findBestTwin(poly, [prop], 0.62), null);
 
@@ -169,12 +183,13 @@ function run() {
   );
   assert.equal(yearsCompatible('Will Trump win?', 'Will Trump win the 2028 election?'), true);
 
-  // --- Close time outside window ---
+  // --- Close time outside window (30 days apart, > 14d limit) ---
+  const farFutureIso = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
   assert.equal(
     findBestTwin(poly, [
       {
         ...kalshiTwin,
-        raw_data: { close_time: '2026-11-20T00:00:00Z', yes_sub_title: 'BetBoom Team' },
+        raw_data: { close_time: farFutureIso, yes_sub_title: 'BetBoom Team' },
       },
     ]),
     null
@@ -187,7 +202,7 @@ function run() {
     external_id: 'AMB_A',
     title: 'Colorado Rockies vs Milwaukee Brewers Winner',
     prices: [0.51, 0.49],
-    raw_data: { close_time: '2026-07-01T00:00:00Z' },
+    raw_data: { close_time: futureIso },
   });
   const ambB = market({
     canonical_id: 'kalshi_AMB_B',
@@ -195,7 +210,7 @@ function run() {
     external_id: 'AMB_B',
     title: 'Colorado Rockies vs Milwaukee Brewers Winner?',
     prices: [0.52, 0.48],
-    raw_data: { close_time: '2026-07-01T00:00:00Z' },
+    raw_data: { close_time: futureIso },
   });
   const polySports = market({
     canonical_id: 'polymarket_sports',
@@ -203,7 +218,7 @@ function run() {
     external_id: 'sports',
     title: 'Colorado Rockies vs Milwaukee Brewers',
     prices: [0.5, 0.5],
-    raw_data: { end_date: '2026-07-01T00:00:00Z' },
+    raw_data: { end_date: futureIso },
   });
   const amb = findBestTwinDetailed(polySports, [ambA, ambB], 0.5);
   assert.equal(amb.match, null, 'ambiguous twins must not pick arbitrarily');
@@ -241,7 +256,7 @@ function run() {
     external_id: '0xfed',
     title: 'BetBoom Team wins the series',
     prices: [0.55, 0.45],
-    raw_data: { end_date: '2026-10-08T14:00:00Z' },
+    raw_data: { end_date: futureIso },
   });
   const eventAsTwin = market({
     canonical_id: 'polymarket_event_1',
@@ -250,7 +265,7 @@ function run() {
     title: 'BetBoom Team vs OG',
     outcomes: ['BetBoom Team', 'OG'],
     prices: [0.55, 0.45],
-    raw_data: { end_date: '2026-10-08T14:00:00Z' },
+    raw_data: { end_date: futureIso },
   });
   const kalshiSrc = market({
     canonical_id: 'kalshi_KXBB2',
@@ -258,7 +273,7 @@ function run() {
     external_id: 'KXBB2',
     title: 'BetBoom Team wins',
     prices: [0.55, 0.45],
-    raw_data: { close_time: '2026-10-08T14:30:00Z' },
+    raw_data: { close_time: futureIso },
   });
   assert.equal(findBestTwin(kalshiSrc, [eventAsTwin]), null);
   assert.ok(findBestTwin(kalshiSrc, [polyBinary]));

@@ -39,13 +39,14 @@ export type MatchCandidateMarket = {
   raw_data?: Record<string, any> | null;
   active?: boolean | null;
   volume?: number | null;
+  updated_at?: string | null;
 };
 
 export type CrossPlatformMatch = {
   twin: MatchCandidateMarket;
   similarity: number;
   /** Twin YES probability aligned to source outcome (POC alignTwinPrice). */
-  alignedTwinProb: number;
+  alignedTwinProb: number | null;
   pm_platform_id: string;
   kalshi_platform_id: string;
   /** True when loaded from market_matches without a full candidate scan. */
@@ -56,6 +57,7 @@ export type CrossPlatformMatch = {
 export type MatchRejectReason =
   | 'short_title'
   | 'unmatchable_market'
+  | 'expired_market'
   | 'no_candidates'
   | 'platform_mismatch'
   | 'inactive_twin'
@@ -64,6 +66,7 @@ export type MatchRejectReason =
   | 'close_time'
   | 'score_below_threshold'
   | 'ambiguous_match'
+  | 'ambiguous_outcome_alignment'
   | 'no_twin_price'
   | 'no_match';
 
@@ -97,6 +100,7 @@ export function emptyMatchDiagnostics(): MatchDiagnostics {
     rejected: {
       short_title: 0,
       unmatchable_market: 0,
+      expired_market: 0,
       no_candidates: 0,
       platform_mismatch: 0,
       inactive_twin: 0,
@@ -105,6 +109,7 @@ export function emptyMatchDiagnostics(): MatchDiagnostics {
       close_time: 0,
       score_below_threshold: 0,
       ambiguous_match: 0,
+      ambiguous_outcome_alignment: 0,
       no_twin_price: 0,
       no_match: 0,
     },
@@ -188,11 +193,42 @@ export function closeTimeOf(market: MatchCandidateMarket): string | null {
 }
 
 /**
+ * Returns true if a market is permanently closed, settled, resolved, or past its expiration time.
+ */
+export function isMarketClosedOrExpired(
+  market: MatchCandidateMarket,
+  nowMs = Date.now()
+): boolean {
+  if (market.active === false) return true;
+
+  const raw = (market.raw_data ?? {}) as Record<string, any>;
+  if (raw.closed === true || raw.active === false) return true;
+  if (typeof raw.status === 'string') {
+    const status = raw.status.toLowerCase();
+    if (['closed', 'finalized', 'settled', 'resolved', 'canceled', 'cancelled'].includes(status)) {
+      return true;
+    }
+  }
+  if (raw.result != null && raw.result !== '') return true;
+
+  const closeStr = closeTimeOf(market);
+  if (closeStr) {
+    const closeMs = Date.parse(closeStr);
+    if (Number.isFinite(closeMs) && closeMs <= nowMs) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Event-aggregate Polymarket rows (`polymarket_event_*`) bundle many outcomes;
  * twinning them to a single Kalshi binary market is usually semantically wrong.
  */
-export function isMatchableMarket(market: MatchCandidateMarket): boolean {
+export function isMatchableMarket(market: MatchCandidateMarket, nowMs = Date.now()): boolean {
   if (market.active === false) return false;
+  if (isMarketClosedOrExpired(market, nowMs)) return false;
   const id = String(market.canonical_id ?? '');
   if (id.includes('_event_')) return false;
   const title = market.title?.trim();
@@ -248,7 +284,7 @@ export function alignTwinReliableProb(
   twin: MatchCandidateMarket,
   rawTwinProb: number,
   sourceProb?: number | null
-): number {
+): number | null {
   return alignTwinPrice(
     source.title,
     outcomeLabel(source),
@@ -281,15 +317,17 @@ function platformIds(
 export function scoreTwinAgainstSource(
   source: MatchCandidateMarket,
   twin: MatchCandidateMarket,
-  sourceProb?: number | null
+  sourceProb?: number | null,
+  nowMs = Date.now()
 ): CrossPlatformMatch | null {
-  if (!isMatchableMarket(source)) return null;
+  if (!isMatchableMarket(source, nowMs)) return null;
 
   const title = source.title!.trim();
   const otherPlatform = source.platform === 'polymarket' ? 'kalshi' : 'polymarket';
   if (twin.platform !== otherPlatform) return null;
   if (twin.active === false) return null;
-  if (!isMatchableMarket(twin) && String(twin.canonical_id).includes('_event_')) {
+  if (isMarketClosedOrExpired(twin, nowMs)) return null;
+  if (!isMatchableMarket(twin, nowMs) && String(twin.canonical_id).includes('_event_')) {
     return null;
   }
   if (!closeTimesAligned(closeTimeOf(source), closeTimeOf(twin))) return null;
@@ -313,6 +351,7 @@ export function scoreTwinAgainstSource(
     rawPrice,
     srcProb
   );
+  if (aligned == null) return null;
 
   return {
     twin,
@@ -352,10 +391,14 @@ export function findBestTwinDetailed(
     stageCounts[r] = (stageCounts[r] ?? 0) + 1;
   };
 
-  if (!isMatchableMarket(source)) {
+  const nowMs = Date.now();
+  if (!isMatchableMarket(source, nowMs)) {
     const title = source.title?.trim();
     if (!title || title.length < 8) {
       return { match: null, rejectReason: 'short_title', bestScore: 0, stageCounts };
+    }
+    if (isMarketClosedOrExpired(source, nowMs)) {
+      return { match: null, rejectReason: 'expired_market', bestScore: 0, stageCounts };
     }
     return {
       match: null,
@@ -392,6 +435,10 @@ export function findBestTwinDetailed(
     }
     if (cand.active === false) {
       bump('inactive_twin');
+      continue;
+    }
+    if (isMarketClosedOrExpired(cand, nowMs)) {
+      bump('expired_market');
       continue;
     }
     // Skip event aggregates as twins too.
@@ -438,6 +485,10 @@ export function findBestTwinDetailed(
       rawPrice,
       srcProb
     );
+    if (aligned == null) {
+      bump('ambiguous_outcome_alignment');
+      continue;
+    }
 
     const rawDist =
       srcProb != null ? Math.abs(srcProb - rawPrice) : Number.POSITIVE_INFINITY;
@@ -614,7 +665,7 @@ async function loadPersistedMatch(
 
   const { data: twin, error: twinError } = await supabaseAdmin
     .from('markets')
-    .select('canonical_id, platform, external_id, title, outcomes, prices, raw_data, active')
+    .select('canonical_id, platform, external_id, title, outcomes, prices, raw_data, active, updated_at')
     .eq('platform', twinPlatform)
     .eq('external_id', twinExt)
     .maybeSingle();
@@ -644,6 +695,7 @@ const CANDIDATE_SELECT = [
   'prices',
   'active',
   'volume',
+  'updated_at',
   'yes_sub_title:raw_data->yes_sub_title',
   'group_item_title:raw_data->groupItemTitle',
   'close_time:raw_data->close_time',
@@ -669,6 +721,7 @@ function candidateFromRow(row: Record<string, unknown>): MatchCandidateMarket {
     prices: row.prices as number[] | null | undefined,
     active: row.active as boolean | null | undefined,
     volume: row.volume as number | null | undefined,
+    updated_at: row.updated_at != null ? String(row.updated_at) : null,
     raw_data: {
       yes_sub_title: row.yes_sub_title ?? null,
       groupItemTitle: row.group_item_title ?? null,
@@ -702,7 +755,7 @@ async function queryCandidatePool(
     return [];
   }
   const rows = dedupeCandidates(
-    (data ?? []).map((row) => candidateFromRow(row as Record<string, unknown>))
+    (data ?? []).map((row) => candidateFromRow((row as unknown) as Record<string, unknown>))
   );
   candidateCache.set(cacheKey, { at: Date.now(), rows });
   return rows;

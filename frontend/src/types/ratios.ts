@@ -31,6 +31,9 @@ export interface RatioInputs {
   prob24hAgo?: number | null;
   polyProb?: number | null;
   kalshiProb?: number | null;
+  polyProbTs?: number | null;
+  kalshiProbTs?: number | null;
+  quoteFreshness?: 'live' | 'stale' | 'unavailable' | null;
   daysToClose?: number | null;
   closes7dCount?: number | null;
   matchFromCache?: boolean | null;
@@ -46,4 +49,5 @@ export interface MarketCross {
   primaryMarket?: RatioMarketSummary | null;
   counterMarket?: RatioMarketSummary | string | null;
   inputs?: RatioInputs | null;
+  ratioSkips?: Record<string, string> | null;
 }

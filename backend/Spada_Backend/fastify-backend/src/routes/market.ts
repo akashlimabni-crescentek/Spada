@@ -194,6 +194,11 @@ const MARKET_CARD_COLUMNS = [
   'raw_ticker:raw_data->ticker',
 ].join(', ');
 
+type MarketCardRow = {
+  canonical_id: string;
+  [key: string]: unknown;
+};
+
 function formatCardRow(row: any) {
   return formatMarket({
     ...row,
@@ -314,7 +319,7 @@ async function loadMovers(platform: string | null, category: string, limit: numb
 
   const { data, error: cardError } = await supabaseAdmin
     .from('markets')
-    .select(MARKET_CARD_COLUMNS)
+    .select<string, MarketCardRow>(MARKET_CARD_COLUMNS)
     .in('canonical_id', ids);
   if (cardError) throw new Error(cardError.message);
 
@@ -346,6 +351,12 @@ async function loadEndingSoon(platform: string | null, category: string, limit: 
   writeDashboardCache(cacheKey, endingSoon);
   return endingSoon;
 }
+
+
+function applyStaticCandleDifference(candles: any[]) {
+  return candles;
+}
+
 
 export async function marketRoutes(fastify: FastifyInstance) {
   // 1. GET /api/v1/markets/metrics
@@ -518,10 +529,10 @@ export async function marketRoutes(fastify: FastifyInstance) {
         if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs < fromMs) {
           return reply.status(400).send({ error: 'from and to must be valid timestamps' });
         }
-        // Support long-running market histories (up to 10 years).
-        const maxWindowMs = 10 * 365 * 24 * 60 * 60 * 1000;
+        // POC OHLCV 1d/1w look back 365 days. The line chart ALL range stays 90 days.
+        const maxWindowMs = 365 * 24 * 60 * 60 * 1000;
         if (toMs - fromMs > maxWindowMs) {
-          return reply.status(400).send({ error: 'from/to window cannot exceed 10 years' });
+          return reply.status(400).send({ error: 'from/to window cannot exceed 365 days' });
         }
         if (resolutionParam === '1m') {
           const candles = await candleAggregator.getOneMinuteCandles(id, fromMs, toMs, outcomeIndex);
@@ -534,7 +545,7 @@ export async function marketRoutes(fastify: FastifyInstance) {
           toMs,
           outcomeIndex
         );
-        return reply.status(200).send({ candles });
+        return reply.status(200).send({ candles: applyStaticCandleDifference(candles) });
       }
 
       if (resolutionParam === '1m') {
@@ -546,7 +557,7 @@ export async function marketRoutes(fastify: FastifyInstance) {
         resolutionParam as CandleResolution,
         outcomeIndex
       );
-      return reply.status(200).send({ candles });
+      return reply.status(200).send({ candles: applyStaticCandleDifference(candles) });
     } catch (err: any) {
       return reply.status(500).send({ error: err.message });
     }

@@ -1,13 +1,14 @@
 import 'dotenv/config';
 import WebSocket from 'ws';
 import { livePinnedIds, watchLivePins } from '../lib/livePins.js';
-import { rememberLiveQuote } from '../lib/liveQuotes.js';
+import { readLiveQuoteRecord, rememberLiveQuote } from '../lib/liveQuotes.js';
 import { venueLookup } from '../lib/venueDns.js';
 import { supabaseAdmin } from '../lib/supabase.js';
 import { broadcastPriceUpdate } from '../routes/websocket.js';
 import { buildKalshiWsAuthHeaders, kalshiGet, KALSHI_WS_URL } from '../lib/kalshiClient.js';
 import { candleAggregator } from '../services/candleAggregator.js';
 import { pricesNeedPersist } from '../lib/pricePersist.js';
+import { parseSourceTimestampMs } from '../lib/ratios.js';
 import {
   countRecentTicks,
   formatPriceStreamCoverage,
@@ -61,6 +62,7 @@ interface ResolvedPin {
   ticker: string | null;
   tokens: Array<{ id: string; outcomeIndex: number; isMulti: boolean }>;
   prices: number[] | null;
+  sourceTs?: number | null;
 }
 
 /** Markets a browser currently has open. Kept across the 5-minute rotation. */
@@ -111,23 +113,34 @@ function chunkArray<T>(items: T[], size: number): T[][] {
   return chunks;
 }
 
+export { parseSourceTimestampMs };
+
 function clampProb(n: number): number | null {
   if (!Number.isFinite(n)) return null;
   if (n < 0 || n > 1) return null;
   return Number(n.toFixed(4));
 }
 
-function queuePriceUpdate(canonicalId: string, prices: number[]) {
+function queuePriceUpdate(
+  canonicalId: string,
+  prices: number[],
+  sourceTs?: number | null
+) {
   const next = [...prices];
   marketPrices.set(canonicalId, next);
-  rememberLiveQuote(canonicalId, next);
+  const existing = readLiveQuoteRecord(canonicalId);
+  const effectiveSourceTs =
+    sourceTs != null && Number.isFinite(sourceTs)
+      ? sourceTs
+      : (existing?.sourceTs ?? null);
+  rememberLiveQuote(canonicalId, next, effectiveSourceTs);
   updateQueue.set(canonicalId, { canonicalId, prices: [...next] });
 }
 
 function recordPolymarketPrice(
   assetId: string,
   rawPrice: number,
-  options: { isTrade?: boolean; volume?: number } = {}
+  options: { isTrade?: boolean; volume?: number; sourceTs?: number | null } = {}
 ) {
   const mapping = tokenToCanonicalMap.get(String(assetId));
   const price = clampProb(rawPrice);
@@ -149,7 +162,7 @@ function recordPolymarketPrice(
     currentPrices[1] = noPrice;
   }
 
-  queuePriceUpdate(canonicalId, currentPrices);
+  queuePriceUpdate(canonicalId, currentPrices, options.sourceTs);
   lastTickAtByMarket.set(canonicalId, Date.now());
 
   // OHLC series is keyed by CLOB token_id (matches polymarket_ohlc / get_candles)
@@ -162,14 +175,14 @@ function recordPolymarketPrice(
 function recordKalshiYesPrice(
   ticker: string,
   yesPriceRaw: number,
-  options: { isTrade?: boolean; volume?: number } = {}
+  options: { isTrade?: boolean; volume?: number; sourceTs?: number | null } = {}
 ) {
   const canonicalId = tickerToCanonicalMap.get(String(ticker));
   const yesPrice = clampProb(yesPriceRaw);
   if (!canonicalId || yesPrice == null) return;
 
   const noPrice = clampProb(1 - yesPrice) ?? Number((1 - yesPrice).toFixed(4));
-  queuePriceUpdate(canonicalId, [yesPrice, noPrice]);
+  queuePriceUpdate(canonicalId, [yesPrice, noPrice], options.sourceTs);
   lastTickAtByMarket.set(canonicalId, Date.now());
   candleAggregator.ingestLiveTick('kalshi', String(ticker), yesPrice, {
     isTrade: options.isTrade,
@@ -531,13 +544,15 @@ function handlePolymarketMessage(payload: unknown, ws: WebSocket): void {
       const bids = Array.isArray(event.bids) ? event.bids : [];
       const asks = Array.isArray(event.asks) ? event.asks : [];
       const mid = clobMidpoint(Number(bids[0]?.price ?? NaN), Number(asks[0]?.price ?? NaN));
-      if (mid != null) recordPolymarketPrice(event.asset_id, mid);
+      const sourceTs = parseSourceTimestampMs(event.timestamp ?? event.time);
+      if (mid != null) recordPolymarketPrice(event.asset_id, mid, { sourceTs });
       continue;
     }
 
     if (eventType === 'best_bid_ask' && event.asset_id) {
       const mid = clobMidpoint(Number(event.best_bid ?? NaN), Number(event.best_ask ?? NaN));
-      if (mid != null) recordPolymarketPrice(event.asset_id, mid);
+      const sourceTs = parseSourceTimestampMs(event.timestamp ?? event.time);
+      if (mid != null) recordPolymarketPrice(event.asset_id, mid, { sourceTs });
       continue;
     }
 
@@ -558,8 +573,9 @@ function handlePolymarketMessage(payload: unknown, ws: WebSocket): void {
       for (const change of event.price_changes) {
         const assetId = change?.asset_id;
         const mid = clobMidpoint(Number(change?.best_bid ?? NaN), Number(change?.best_ask ?? NaN));
+        const sourceTs = parseSourceTimestampMs(change?.timestamp ?? event.timestamp ?? event.time);
         if (assetId && mid != null) {
-          recordPolymarketPrice(assetId, mid);
+          recordPolymarketPrice(assetId, mid, { sourceTs });
         }
       }
     }
@@ -807,7 +823,10 @@ function seedKalshiPin(ticker: string): void {
         return;
       }
       console.log(`[Price Stream][Kalshi] pin snapshot ${ticker} mid=${mid}`);
-      recordKalshiYesPrice(ticker, mid);
+      const sourceTs = parseSourceTimestampMs(
+        market.updated_time ?? market.close_time ?? market.open_time ?? market.created_time ?? market.ts ?? market.timestamp
+      );
+      recordKalshiYesPrice(ticker, mid, { sourceTs });
     })
     .catch((err: any) => {
       console.warn(`[Price Stream][Kalshi] pin snapshot ${ticker}:`, err?.message ?? err);
@@ -822,7 +841,7 @@ function applyResolvedPin(pin: ResolvedPin): void {
       marketPrices.set(pin.canonicalId, pin.prices ?? [0.5, 0.5]);
     }
     if (pin.prices?.some((price) => Number.isFinite(price) && price > 0)) {
-      queuePriceUpdate(pin.canonicalId, pin.prices);
+      queuePriceUpdate(pin.canonicalId, pin.prices, pin.sourceTs);
     }
     pushKalshiPin(pin.ticker);
     seedKalshiPin(pin.ticker);
@@ -844,7 +863,7 @@ function applyResolvedPin(pin: ResolvedPin): void {
   }
   const prices = pin.prices ?? [];
   if (prices.some((price) => Number.isFinite(price) && price > 0)) {
-    queuePriceUpdate(pin.canonicalId, prices);
+    queuePriceUpdate(pin.canonicalId, prices, pin.sourceTs);
   }
   pushPolymarketPin(pin.tokens.map((token) => token.id));
 }
@@ -852,7 +871,7 @@ function applyResolvedPin(pin: ResolvedPin): void {
 async function loadAndApplyPin(canonicalId: string): Promise<void> {
   const { data, error } = await supabaseAdmin
     .from('markets')
-    .select('canonical_id, platform, external_id, prices, raw_data')
+    .select('canonical_id, platform, external_id, prices, raw_data, updated_at')
     .eq('canonical_id', canonicalId)
     .maybeSingle();
 
@@ -866,6 +885,7 @@ async function loadAndApplyPin(canonicalId: string): Promise<void> {
   const prices = Array.isArray(data.prices)
     ? (data.prices as unknown[]).map((price) => Number(price))
     : null;
+  const sourceTs = parseSourceTimestampMs(data.updated_at);
 
   if (platform === 'kalshi') {
     const ticker = String(data.external_id || canonicalId.replace(/^kalshi_/, '')).trim();
@@ -876,6 +896,7 @@ async function loadAndApplyPin(canonicalId: string): Promise<void> {
       ticker,
       tokens: [],
       prices,
+      sourceTs,
     };
     resolvedPins.set(canonicalId, pin);
     applyResolvedPin(pin);
@@ -892,6 +913,7 @@ async function loadAndApplyPin(canonicalId: string): Promise<void> {
     ticker: null,
     tokens: subscribeTokens.map((id, outcomeIndex) => ({ id, outcomeIndex, isMulti })),
     prices,
+    sourceTs,
   };
   resolvedPins.set(canonicalId, pin);
   applyResolvedPin(pin);
@@ -972,7 +994,10 @@ function handleKalshiMessage(raw: string) {
         }
         break;
       }
-      recordKalshiYesPrice(ticker, mid);
+      const sourceTs = parseSourceTimestampMs(
+        payload.ts ?? payload.timestamp ?? payload.updated_time
+      );
+      recordKalshiYesPrice(ticker, mid, { sourceTs });
       break;
     }
     case 'trade': {

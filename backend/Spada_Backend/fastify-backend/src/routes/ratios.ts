@@ -6,7 +6,7 @@ import {
 } from '../services/ratioEngine.js';
 
 const MARKET_SELECT =
-  'canonical_id, platform, external_id, title, outcomes, prices, volume, raw_data, active';
+  'canonical_id, platform, external_id, title, outcomes, prices, volume, raw_data, active, updated_at';
 
 export async function ratioRoutes(fastify: FastifyInstance) {
   // GET /api/v1/ratios/:marketId (canonical_id or external_id)

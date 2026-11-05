@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '../lib/supabase.js';
 import { kalshiGet } from '../lib/kalshiClient.js';
+import { parseSourceTimestampMs } from '../lib/ratios.js';
 import {
   extractKalshiYesNoBids,
   kalshiToYesBook,
@@ -145,7 +146,8 @@ class OrderbookStore {
       platform: 'polymarket',
       bids: [],
       asks: [],
-      timestamp: new Date().toISOString(),
+      timestamp: null,
+      received_at: new Date().toISOString(),
       cached: false,
       closed: true,
     };
@@ -192,7 +194,10 @@ class OrderbookStore {
         const book = await res.json();
         const bids = book.bids || [];
         const asks = book.asks || [];
-        const timestamp = new Date().toISOString();
+        const rawTs = book.timestamp ?? book.time ?? book.last_updated;
+        const exchangeTsMs = parseSourceTimestampMs(rawTs);
+        const timestamp = exchangeTsMs != null ? new Date(exchangeTsMs).toISOString() : null;
+        const receivedAt = new Date().toISOString();
 
         const response = {
           canonical_id: canonicalId,
@@ -200,6 +205,7 @@ class OrderbookStore {
           bids,
           asks,
           timestamp,
+          received_at: receivedAt,
           cached: false,
         };
 
@@ -211,7 +217,7 @@ class OrderbookStore {
             noTokenId,
             bids,
             asks,
-            timestamp,
+            timestamp: timestamp ?? receivedAt,
           })
         );
 
@@ -245,7 +251,15 @@ class OrderbookStore {
         // Also expose YES-side bids/asks so FE/consumers share one shape with Polymarket.
         const { yesBids, noBids } = extractKalshiYesNoBids(orderbook);
         const yesBook = kalshiToYesBook(yesBids, noBids);
-        const timestamp = new Date().toISOString();
+        const rawTs =
+          (data as any)?.timestamp ??
+          (data as any)?.ts ??
+          (data as any)?.updated_time ??
+          (orderbook as any)?.ts ??
+          (orderbook as any)?.updated_time;
+        const exchangeTsMs = parseSourceTimestampMs(rawTs);
+        const timestamp = exchangeTsMs != null ? new Date(exchangeTsMs).toISOString() : null;
+        const receivedAt = new Date().toISOString();
 
         const response = {
           canonical_id: canonicalId,
@@ -254,6 +268,7 @@ class OrderbookStore {
           bids: yesBook.bids.map((l) => ({ price: l.price, size: l.qty })),
           asks: yesBook.asks.map((l) => ({ price: l.price, size: l.qty })),
           timestamp,
+          received_at: receivedAt,
           cached: false,
         };
 
@@ -261,7 +276,7 @@ class OrderbookStore {
           this.persistKalshiSnapshot({
             ticker: String(ticker),
             orderbook,
-            timestamp,
+            timestamp: timestamp ?? receivedAt,
           })
         );
 
@@ -297,7 +312,7 @@ class OrderbookStore {
     };
     const { yesBids, noBids } = extractKalshiYesNoBids(orderbook);
     const yesBook = kalshiToYesBook(yesBids, noBids);
-    const timestamp = String(data.last_snapshot || data.updated_at || new Date().toISOString());
+    const timestamp = data.last_snapshot ? String(data.last_snapshot) : data.updated_at ? String(data.updated_at) : null;
 
     return {
       canonical_id: canonicalId,
@@ -306,6 +321,7 @@ class OrderbookStore {
       bids: yesBook.bids.map((l) => ({ price: l.price, size: l.qty })),
       asks: yesBook.asks.map((l) => ({ price: l.price, size: l.qty })),
       timestamp,
+      received_at: new Date().toISOString(),
       cached: true,
     };
   }
@@ -335,7 +351,7 @@ class OrderbookStore {
       price: String(1 - Number(l.price)),
       size: String(l.qty),
     }));
-    const timestamp = String(data.last_snapshot || data.updated_at || new Date().toISOString());
+    const timestamp = data.last_snapshot ? String(data.last_snapshot) : data.updated_at ? String(data.updated_at) : null;
 
     return {
       canonical_id: canonicalId,
@@ -343,6 +359,7 @@ class OrderbookStore {
       bids,
       asks,
       timestamp,
+      received_at: new Date().toISOString(),
       cached: true,
     };
   }
