@@ -83,6 +83,9 @@ export function HistoricalOhlcvChart({ market }: HistoricalOhlcvChartProps) {
 
   // Chart handle ref — accessed directly for ticks and prepend, no React state
   const handleRef = useRef<MultiLineChartHandle | null>(null);
+  // If data arrives before the chart DOM mounts, store the seed fn here and
+  // call it once the handle is ready (fixes blank chart on hard refresh).
+  const pendingSeedRef = useRef<(() => void) | null>(null);
 
   const visibleKey = [...visibleIds].sort((a, b) => a - b).join(",");
 
@@ -191,43 +194,53 @@ export function HistoricalOhlcvChart({ market }: HistoricalOhlcvChartProps) {
     earliestLoadedSecRef.current = earliest === Infinity ? null : earliest;
     exhaustedRef.current = false;
 
-    historyKeyRef.current = historyKey;
+    // Build the seed function — called immediately if handle is ready,
+    // or stored in pendingSeedRef for MultiLineChartView to call once mounted.
+    const doSeed = () => {
+      const handle = handleRef.current;
+      if (!handle) return;
 
-    const handle = handleRef.current;
-    if (!handle) return;
+      const series = buildOutcomeLineSeries({
+        candlesByOutcome,
+        range: "ALL",
+        outcomes,
+        visibleIds: [...visibleIds],
+        binary,
+      });
 
-    const series = buildOutcomeLineSeries({
-      candlesByOutcome,
-      range: "ALL",
-      outcomes,
-      visibleIds: [...visibleIds],
-      binary,
-    });
+      const quote = usePriceStore.getState();
+      const quotedAt = quote.quotedAt[marketId];
+      const quotePrices = quote.prices[marketId];
+      const timeSec = quotedAt ? Math.floor(Date.parse(quotedAt) / 1000) : NaN;
 
-    // Apply current live tip before handing to chart
-    const quote = usePriceStore.getState();
-    const quotedAt = quote.quotedAt[marketId];
-    const quotePrices = quote.prices[marketId];
-    const timeSec = quotedAt ? Math.floor(Date.parse(quotedAt) / 1000) : NaN;
-
-    const chartSeries: MultiLineChartSeries[] = series.map((s) => {
-      let points = s.points.map((p) => ({ time: p.time as UTCTimestamp, value: p.value }));
-      if (quotePrices?.length && Number.isFinite(timeSec)) {
-        const livePrice = linePriceForOutcome(quotePrices, s.id, binary);
-        if (livePrice != null) {
-          const last = points[points.length - 1];
-          if (!last || timeSec > (last.time as number)) {
-            points = [...points, { time: timeSec as UTCTimestamp, value: livePrice }];
-          } else if (timeSec === (last.time as number)) {
-            points = [...points.slice(0, -1), { time: last.time, value: livePrice }];
+      const chartSeries: MultiLineChartSeries[] = series.map((s) => {
+        let points = s.points.map((p) => ({ time: p.time as UTCTimestamp, value: p.value }));
+        if (quotePrices?.length && Number.isFinite(timeSec)) {
+          const livePrice = linePriceForOutcome(quotePrices, s.id, binary);
+          if (livePrice != null) {
+            const last = points[points.length - 1];
+            if (!last || timeSec > (last.time as number)) {
+              points = [...points, { time: timeSec as UTCTimestamp, value: livePrice }];
+            } else if (timeSec === (last.time as number)) {
+              points = [...points.slice(0, -1), { time: last.time, value: livePrice }];
+            }
           }
         }
-      }
-      return { id: s.id, label: s.label, color: s.color, points };
-    });
+        return { id: s.id, label: s.label, color: s.color, points };
+      });
 
-    const viewport = lineRangeViewport(lineRange);
-    handle.setHistory(chartSeries, { fit: true, timeRange: viewport });
+      const viewport = lineRangeViewport(lineRange);
+      handle.setHistory(chartSeries, { fit: true, timeRange: viewport });
+      historyKeyRef.current = historyKey;
+      pendingSeedRef.current = null;
+    };
+
+    if (handleRef.current) {
+      doSeed();
+    } else {
+      // Chart DOM not mounted yet — store for MultiLineChartView to call
+      pendingSeedRef.current = doSeed;
+    }
   }, [binary, historyKey, lineQuery.data, lineRange, marketId, mode, outcomes, visibleIds]);
 
   // ─── Viewport-only update when timeframe button changes ───────────────────
@@ -478,6 +491,7 @@ export function HistoricalOhlcvChart({ market }: HistoricalOhlcvChartProps) {
           height={chartHeight}
           handleRef={handleRef}
           onScrollNearLeft={handleScrollNearLeft}
+          pendingSeedRef={pendingSeedRef}
         />
       ) : null}
 
@@ -500,10 +514,12 @@ function MultiLineChartView({
   height,
   handleRef,
   onScrollNearLeft,
+  pendingSeedRef,
 }: {
   height: number;
   handleRef: React.MutableRefObject<MultiLineChartHandle | null>;
   onScrollNearLeft: () => void;
+  pendingSeedRef: React.MutableRefObject<(() => void) | null>;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const onScrollNearLeftRef = useRef(onScrollNearLeft);
@@ -525,6 +541,9 @@ function MultiLineChartView({
       });
       handleRef.current = handle;
 
+      // Data may have arrived before the chart mounted — flush the pending seed now
+      pendingSeedRef.current?.();
+
       observer = new ResizeObserver((entries) => {
         const width = entries[0]?.contentRect.width;
         if (!width || !handle) return;
@@ -539,7 +558,7 @@ function MultiLineChartView({
       handle?.destroy();
       handleRef.current = null;
     };
-  }, [height, handleRef]);
+  }, [height, handleRef, pendingSeedRef]);
 
   return (
     <div className="chart-shell" ref={containerRef} style={{ height, minHeight: height }} />
