@@ -65,6 +65,8 @@ export type MultiLineChartHandle = {
   updateTick: (timeSec: number, getPrice: (id: number) => number | null) => void;
   /** Re-sync after network reconnect: updates data while preserving visible logical range. */
   resync: (seriesList: MultiLineChartSeries[]) => void;
+  /** Prepend older historical data without resetting the user's viewport. */
+  prependHistory: (seriesList: MultiLineChartSeries[]) => void;
   /** Legacy setLines support */
   setLines: (lines: ChartLineSeries[], options?: { fit?: boolean }) => void;
   resize: (width: number, height: number) => void;
@@ -700,7 +702,8 @@ export function createLineChart(
 export function createMultiLineChart(
   container: HTMLElement,
   wrapperOrHeight: HTMLElement | number,
-  maybeHeight?: number
+  maybeHeight?: number,
+  options?: { onScrollNearLeft?: () => void }
 ): MultiLineChartHandle {
   const wrapper = typeof wrapperOrHeight === "object" ? wrapperOrHeight : null;
   const height = typeof wrapperOrHeight === "number" ? wrapperOrHeight : (maybeHeight ?? 420);
@@ -831,6 +834,16 @@ export function createMultiLineChart(
     tooltip.setAttribute("role", "tooltip");
     wrapper.appendChild(tooltip);
     chart.subscribeCrosshairMove(onCrosshair);
+  }
+
+  // Scroll-edge detection: fire onScrollNearLeft when fewer than 10 bars
+  // are visible to the left of the viewport (user is near the left edge).
+  if (options?.onScrollNearLeft) {
+    const cb = options.onScrollNearLeft;
+    chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+      if (!range) return;
+      if (range.from < 10) cb();
+    });
   }
 
   return {
@@ -976,6 +989,25 @@ export function createMultiLineChart(
         }
       }
 
+      if (savedRange) {
+        chart.timeScale().setVisibleLogicalRange(savedRange);
+      }
+    },
+
+    prependHistory(seriesList: MultiLineChartSeries[]) {
+      // Save the user's current viewport before setData resets the time scale
+      const savedRange = chart.timeScale().getVisibleLogicalRange();
+
+      for (const item of seriesList) {
+        const series = seriesById.get(item.id);
+        if (!series) continue;
+        series.setData(item.points);
+        if (item.points.length > 0) {
+          lastPointsById.set(item.id, item.points[item.points.length - 1]);
+        }
+      }
+
+      // Restore viewport so the user stays exactly where they were
       if (savedRange) {
         chart.timeScale().setVisibleLogicalRange(savedRange);
       }

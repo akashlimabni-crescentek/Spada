@@ -1,16 +1,17 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import type { UTCTimestamp } from "lightweight-charts";
 
 import { RealtimeOhlcvChart } from "@/components/custom/markets/RealtimeOhlcvChart";
 import { Card } from "@/components/ui/card";
 import { fetchMarketCandles } from "@/hooks/useMarketCandles";
 import {
-  applyLivePricesToLineSeries,
   buildOutcomeLineSeries,
-  lineRangeToResolution,
-  lineRangeToWindow,
+  lineFullHistoryWindow,
+  linePriceForOutcome,
+  lineRangeViewport,
 } from "@/lib/candles/lineRange";
 import {
   CANDLE_RESOLUTIONS,
@@ -22,8 +23,9 @@ import {
   type ChartLineSeries,
   type ChartMode,
   type LineRange,
+  type NormalizedCandle,
 } from "@/lib/candles/types";
-import type { MultiLineChartHandle } from "@/lib/charts/ohlcvChart";
+import type { MultiLineChartHandle, MultiLineChartSeries } from "@/lib/charts/ohlcvChart";
 import { cn } from "@/lib/utils";
 import { usePriceStore } from "@/stores/usePriceStore";
 import type { Market } from "@/types/market";
@@ -52,6 +54,14 @@ function marketOutcomes(market: Market): string[] {
   return ["Yes", "No"];
 }
 
+/** Merge two candle arrays by timestamp. Later entries overwrite earlier ones. */
+function mergeCandles(base: NormalizedCandle[], overlay: NormalizedCandle[]): NormalizedCandle[] {
+  const byTime = new Map<number, NormalizedCandle>();
+  for (const c of base) byTime.set(c.time, c);
+  for (const c of overlay) byTime.set(c.time, c);
+  return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+}
+
 export function HistoricalOhlcvChart({ market }: HistoricalOhlcvChartProps) {
   const marketId = market.canonical_id;
   const outcomes = useMemo(() => marketOutcomes(market), [market]);
@@ -62,45 +72,21 @@ export function HistoricalOhlcvChart({ market }: HistoricalOhlcvChartProps) {
   const [resolution, setResolution] = useState<CandleResolution>(DEFAULT_CANDLE_RESOLUTION);
   const [visibleIds, setVisibleIds] = useState<Set<number>>(() => new Set());
   const [selectedOutcome, setSelectedOutcome] = useState(0);
-  const [lineSeries, setLineSeries] = useState<ChartLineSeries[]>([]);
 
   const initializedRef = useRef(false);
-  const historyKeyRef = useRef("");
-  const linesRef = useRef<ChartLineSeries[]>([]);
 
-  // Line mode only — OHLCV loads its own history inside RealtimeOhlcvChart.
-  const lineResolution = lineRangeToResolution(lineRange);
+  // In-memory candle store — never stored in React state to avoid re-renders
+  const loadedCandlesRef = useRef<Map<number, NormalizedCandle[]>>(new Map());
+  const earliestLoadedSecRef = useRef<number | null>(null);
+  const loadingOlderRef = useRef(false);
+  const exhaustedRef = useRef(false);
+
+  // Chart handle ref — accessed directly for ticks and prepend, no React state
+  const handleRef = useRef<MultiLineChartHandle | null>(null);
+
   const visibleKey = [...visibleIds].sort((a, b) => a - b).join(",");
-  const lineQuery = useQuery({
-    queryKey: ["line-candles", marketId, lineRange, lineResolution, visibleKey, binary],
-    enabled: mode === "line" && visibleIds.size > 0,
-    staleTime: 60_000,
-    retry: false,
-    refetchOnWindowFocus: false,
-    queryFn: async () => {
-      const { from, to } = lineRangeToWindow(lineRange);
-      const ids = new Set(visibleIds);
-      if (binary && ids.has(1)) ids.add(0);
-      const entries = await Promise.all(
-        [...ids].map(async (id) => {
-          const rows = await fetchMarketCandles(marketId, lineResolution, {
-            outcome: id,
-            stored: true,
-            from,
-            to,
-          });
-          return [id, rows] as const;
-        })
-      );
-      return new Map(entries);
-    },
-  });
-  const livePrices = usePriceStore((state) => state.prices[marketId]);
-  const prices = useMemo(
-    () => livePrices ?? market.prices ?? [],
-    [livePrices, market.prices]
-  );
 
+  // ─── Outcome initialisation ───────────────────────────────────────────────
   useEffect(() => {
     const { watchMarket, unwatchMarket } = usePriceStore.getState();
     watchMarket(marketId);
@@ -109,8 +95,12 @@ export function HistoricalOhlcvChart({ market }: HistoricalOhlcvChartProps) {
 
   useEffect(() => {
     initializedRef.current = false;
-    linesRef.current = [];
+    loadedCandlesRef.current = new Map();
+    earliestLoadedSecRef.current = null;
+    exhaustedRef.current = false;
   }, [marketId]);
+
+  const prices = usePriceStore((state) => state.prices[marketId]) ?? market.prices ?? [];
 
   useEffect(() => {
     if (initializedRef.current || !outcomes.length) return;
@@ -128,81 +118,226 @@ export function HistoricalOhlcvChart({ market }: HistoricalOhlcvChartProps) {
     setSelectedOutcome(ranked[0]?.index ?? 0);
   }, [outcomes, market.outcome_prices, prices]);
 
-  const lineHistoryKey = `${marketId}|line|${lineResolution}|${lineRange}|${[...visibleIds].sort().join(",")}`;
+  // ─── Full-history fetch (once per market + visibleIds, NOT per range) ─────
+  const lineQuery = useQuery({
+    queryKey: ["line-candles-full", marketId, visibleKey, binary],
+    enabled: mode === "line" && visibleIds.size > 0,
+    staleTime: 5 * 60_000,
+    retry: false,
+    refetchOnWindowFocus: false,
+    queryFn: async () => {
+      const { from, to } = lineFullHistoryWindow();
+      const recentFrom = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
 
-  // Line chart: seed history once per session; live mids update the right edge.
+      const ids = new Set(visibleIds);
+      if (binary && ids.has(1)) ids.add(0);
+
+      // 1h candles for full 365-day history
+      const historyEntries = await Promise.all(
+        [...ids].map(async (id) => {
+          const rows = await fetchMarketCandles(marketId, "1h", {
+            outcome: id,
+            stored: true,
+            from,
+            to,
+          }).catch(() => [] as NormalizedCandle[]);
+          return [id, rows] as const;
+        })
+      );
+
+      // 1m candles for last 24h (fine detail for 1H / 6H views)
+      const recentEntries = await Promise.all(
+        [...ids].map(async (id) => {
+          const rows = await fetchMarketCandles(marketId, "1m", {
+            outcome: id,
+            stored: true,
+            from: recentFrom,
+            to,
+          }).catch(() => [] as NormalizedCandle[]);
+          return [id, rows] as const;
+        })
+      );
+
+      // Merge: 1m overwrites 1h for the overlapping 24h window
+      const merged = new Map<number, NormalizedCandle[]>();
+      for (const [id, base] of historyEntries) {
+        const recent = new Map(recentEntries).get(id) ?? [];
+        merged.set(id, mergeCandles(base, recent));
+      }
+      return merged;
+    },
+  });
+
+  // ─── Seed chart when data arrives (not on range change) ───────────────────
+  const historyKey = `${marketId}|${visibleKey}`;
+  const historyKeyRef = useRef("");
+
   useEffect(() => {
     if (mode !== "line") return;
-
-    const sessionChanged = historyKeyRef.current !== lineHistoryKey;
-    if (sessionChanged) {
-      historyKeyRef.current = lineHistoryKey;
-      linesRef.current = [];
-    }
-
     const candlesByOutcome = lineQuery.data;
-    const hasRows = [...(candlesByOutcome?.values() ?? [])].some((rows) => rows.length > 0);
-    if (!hasRows) {
-      if (sessionChanged) setLineSeries([]);
-      return;
-    }
+    if (!candlesByOutcome) return;
 
-    if (sessionChanged || linesRef.current.length === 0) {
-      const series = buildOutcomeLineSeries({
-        candlesByOutcome: candlesByOutcome!,
-        range: lineRange,
-        outcomes,
-        visibleIds: [...visibleIds],
-        binary,
-      });
-      const quote = usePriceStore.getState();
-      const quotedAt = quote.quotedAt[marketId];
-      const quotePrices = quote.prices[marketId];
-      const timeSec = quotedAt ? Math.floor(Date.parse(quotedAt) / 1000) : NaN;
-      const withTip =
-        quotePrices?.length && Number.isFinite(timeSec)
-          ? applyLivePricesToLineSeries(series, quotePrices, timeSec, binary)
-          : series;
-      linesRef.current = withTip;
-      setLineSeries(withTip);
-    }
-  }, [
-    binary,
-    lineHistoryKey,
-    lineQuery.data,
-    lineRange,
-    marketId,
-    mode,
-    outcomes,
-    visibleIds,
-  ]);
+    const hasRows = [...candlesByOutcome.values()].some((r) => r.length > 0);
+    if (!hasRows) return;
 
-  // POC applies each realtime price as it arrives. A render effect misses a tick
-  // that lands before history is ready and does not run again until the next one.
+    // Store in ref for infinite scroll use
+    loadedCandlesRef.current = candlesByOutcome;
+
+    // Track earliest loaded timestamp for infinite scroll
+    let earliest = Infinity;
+    for (const rows of candlesByOutcome.values()) {
+      if (rows.length > 0 && rows[0].time < earliest) earliest = rows[0].time;
+    }
+    earliestLoadedSecRef.current = earliest === Infinity ? null : earliest;
+    exhaustedRef.current = false;
+
+    historyKeyRef.current = historyKey;
+
+    const handle = handleRef.current;
+    if (!handle) return;
+
+    const series = buildOutcomeLineSeries({
+      candlesByOutcome,
+      range: "ALL",
+      outcomes,
+      visibleIds: [...visibleIds],
+      binary,
+    });
+
+    // Apply current live tip before handing to chart
+    const quote = usePriceStore.getState();
+    const quotedAt = quote.quotedAt[marketId];
+    const quotePrices = quote.prices[marketId];
+    const timeSec = quotedAt ? Math.floor(Date.parse(quotedAt) / 1000) : NaN;
+
+    const chartSeries: MultiLineChartSeries[] = series.map((s) => {
+      let points = s.points.map((p) => ({ time: p.time as UTCTimestamp, value: p.value }));
+      if (quotePrices?.length && Number.isFinite(timeSec)) {
+        const livePrice = linePriceForOutcome(quotePrices, s.id, binary);
+        if (livePrice != null) {
+          const last = points[points.length - 1];
+          if (!last || timeSec > (last.time as number)) {
+            points = [...points, { time: timeSec as UTCTimestamp, value: livePrice }];
+          } else if (timeSec === (last.time as number)) {
+            points = [...points.slice(0, -1), { time: last.time, value: livePrice }];
+          }
+        }
+      }
+      return { id: s.id, label: s.label, color: s.color, points };
+    });
+
+    const viewport = lineRangeViewport(lineRange);
+    handle.setHistory(chartSeries, { fit: true, timeRange: viewport });
+  }, [binary, historyKey, lineQuery.data, lineRange, marketId, mode, outcomes, visibleIds]);
+
+  // ─── Viewport-only update when timeframe button changes ───────────────────
+  useEffect(() => {
+    if (mode !== "line") return;
+    const handle = handleRef.current;
+    if (!handle) return;
+    // Only adjust viewport if history is already loaded
+    if (historyKeyRef.current !== historyKey) return;
+    const viewport = lineRangeViewport(lineRange);
+    handle.setVisibleTimeRange(viewport);
+  }, [historyKey, lineRange, mode]);
+
+  // ─── Live tick: O(1) direct chart update, zero React re-renders ───────────
   useEffect(() => {
     if (mode !== "line") return;
 
-    const applyTick = (prices: number[] | undefined, quotedAt: string | undefined) => {
-      const series = linesRef.current;
-      if (!series.length || !prices?.length || !quotedAt) return;
+    const applyTick = (tickPrices: number[], quotedAt: string) => {
+      const handle = handleRef.current;
+      if (!handle) return;
       const timeSec = Math.floor(Date.parse(quotedAt) / 1000);
       if (!Number.isFinite(timeSec)) return;
-      const updated = applyLivePricesToLineSeries(series, prices, timeSec, binary);
-      if (updated === series) return;
-      linesRef.current = updated;
-      setLineSeries(updated);
+      handle.updateTick(timeSec, (id) => linePriceForOutcome(tickPrices, id, binary));
     };
 
     const current = usePriceStore.getState();
-    applyTick(current.prices[marketId], current.quotedAt[marketId]);
+    if (current.prices[marketId]?.length && current.quotedAt[marketId]) {
+      applyTick(current.prices[marketId], current.quotedAt[marketId]);
+    }
+
     return usePriceStore.subscribe((state, prev) => {
       const next = state.prices[marketId];
       const at = state.quotedAt[marketId];
       if (next === prev.prices[marketId] && at === prev.quotedAt[marketId]) return;
+      if (!next?.length || !at) return;
       applyTick(next, at);
     });
   }, [binary, marketId, mode]);
 
+  // ─── Infinite scroll: fetch older data when user reaches left edge ─────────
+  const handleScrollNearLeft = useCallback(async () => {
+    if (loadingOlderRef.current || exhaustedRef.current) return;
+    const earliest = earliestLoadedSecRef.current;
+    if (earliest == null) return;
+    const handle = handleRef.current;
+    if (!handle) return;
+
+    loadingOlderRef.current = true;
+    try {
+      const toMs = earliest * 1000;
+      const fromMs = toMs - 365 * 24 * 3600 * 1000;
+      const toIso = new Date(toMs).toISOString();
+      const fromIso = new Date(fromMs).toISOString();
+
+      const ids = new Set(visibleIds);
+      if (binary && ids.has(1)) ids.add(0);
+
+      const olderEntries = await Promise.all(
+        [...ids].map(async (id) => {
+          const rows = await fetchMarketCandles(marketId, "1h", {
+            outcome: id,
+            stored: true,
+            from: fromIso,
+            to: toIso,
+          }).catch(() => [] as NormalizedCandle[]);
+          return [id, rows] as const;
+        })
+      );
+
+      const hasOlderData = olderEntries.some(([, rows]) => rows.length > 0);
+      if (!hasOlderData) {
+        exhaustedRef.current = true;
+        return;
+      }
+
+      // Merge older data into existing loaded candles
+      let newEarliest = earliest;
+      for (const [id, olderRows] of olderEntries) {
+        const existing = loadedCandlesRef.current.get(id) ?? [];
+        const merged = mergeCandles(olderRows, existing);
+        loadedCandlesRef.current.set(id, merged);
+        if (merged.length > 0 && merged[0].time < newEarliest) {
+          newEarliest = merged[0].time;
+        }
+      }
+      earliestLoadedSecRef.current = newEarliest;
+
+      // Rebuild series from full merged dataset and prepend without viewport reset
+      const series = buildOutcomeLineSeries({
+        candlesByOutcome: loadedCandlesRef.current,
+        range: "ALL",
+        outcomes,
+        visibleIds: [...visibleIds],
+        binary,
+      });
+
+      const chartSeries: MultiLineChartSeries[] = series.map((s) => ({
+        id: s.id,
+        label: s.label,
+        color: s.color,
+        points: s.points.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })),
+      }));
+
+      handle.prependHistory(chartSeries);
+    } finally {
+      loadingOlderRef.current = false;
+    }
+  }, [binary, marketId, outcomes, visibleIds]);
+
+  // ─── Outcome toggle ────────────────────────────────────────────────────────
   const toggleOutcome = (id: number) => {
     setVisibleIds((prev) => {
       const next = new Set(prev);
@@ -215,11 +350,15 @@ export function HistoricalOhlcvChart({ market }: HistoricalOhlcvChartProps) {
     });
   };
 
-  const showLoading = mode === "line" && lineQuery.isPending && lineSeries.length === 0;
+  const showLoading = mode === "line" && lineQuery.isPending && !lineQuery.data;
   const showError = mode === "line" && !showLoading && lineQuery.isError;
   const showEmpty =
-    mode === "line" && !showLoading && !lineQuery.isError && lineSeries.length === 0;
-  const showLineChart = mode === "line" && !showLoading && !lineQuery.isError && lineSeries.length > 0;
+    mode === "line" &&
+    !showLoading &&
+    !lineQuery.isError &&
+    lineQuery.data != null &&
+    [...lineQuery.data.values()].every((r) => r.length === 0);
+  const showLineChart = mode === "line" && !showLoading && !lineQuery.isError && !showEmpty;
   const chartHeight = mode === "line" ? LINE_CHART_HEIGHT : OHLCV_CHART_HEIGHT;
 
   return (
@@ -274,7 +413,11 @@ export function HistoricalOhlcvChart({ market }: HistoricalOhlcvChartProps) {
           </button>
         </div>
 
-        <div className="timeline-bar" role="tablist" aria-label={mode === "line" ? "Time range" : "Candle resolution"}>
+        <div
+          className="timeline-bar"
+          role="tablist"
+          aria-label={mode === "line" ? "Time range" : "Candle resolution"}
+        >
           {mode === "line"
             ? LINE_RANGES.map((range) => (
                 <button
@@ -331,8 +474,13 @@ export function HistoricalOhlcvChart({ market }: HistoricalOhlcvChartProps) {
       ) : null}
 
       {showLineChart ? (
-        <MultiLineChartView lines={lineSeries} height={chartHeight} resetKey={lineHistoryKey} />
+        <MultiLineChartView
+          height={chartHeight}
+          handleRef={handleRef}
+          onScrollNearLeft={handleScrollNearLeft}
+        />
       ) : null}
+
       {mode === "ohlcv" ? (
         <RealtimeOhlcvChart
           marketId={marketId}
@@ -346,22 +494,20 @@ export function HistoricalOhlcvChart({ market }: HistoricalOhlcvChartProps) {
   );
 }
 
+// ─── MultiLineChartView ───────────────────────────────────────────────────────
+// Owns the chart DOM lifecycle only. Data is pushed via handleRef by the parent.
 function MultiLineChartView({
-  lines,
   height,
-  resetKey,
+  handleRef,
+  onScrollNearLeft,
 }: {
-  lines: ChartLineSeries[];
   height: number;
-  resetKey: string;
+  handleRef: React.MutableRefObject<MultiLineChartHandle | null>;
+  onScrollNearLeft: () => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const handleRef = useRef<MultiLineChartHandle | null>(null);
-  const linesRef = useRef(lines);
-  const resetRef = useRef<string | null>(null);
-
-  const resetKeyRef = useRef(resetKey);
-  resetKeyRef.current = resetKey;
+  const onScrollNearLeftRef = useRef(onScrollNearLeft);
+  onScrollNearLeftRef.current = onScrollNearLeft;
 
   useEffect(() => {
     const container = containerRef.current;
@@ -373,11 +519,11 @@ function MultiLineChartView({
 
     void import("@/lib/charts/ohlcvChart").then(({ createMultiLineChart }) => {
       if (cancelled || !containerRef.current) return;
-      handle = createMultiLineChart(containerRef.current, height);
+
+      handle = createMultiLineChart(containerRef.current, height, undefined, {
+        onScrollNearLeft: () => onScrollNearLeftRef.current(),
+      });
       handleRef.current = handle;
-      const hasPoints = linesRef.current.some((line) => line.points.length > 0);
-      handle.setLines(linesRef.current, { fit: hasPoints });
-      if (hasPoints) resetRef.current = resetKeyRef.current;
 
       observer = new ResizeObserver((entries) => {
         const width = entries[0]?.contentRect.width;
@@ -392,17 +538,8 @@ function MultiLineChartView({
       observer?.disconnect();
       handle?.destroy();
       handleRef.current = null;
-      resetRef.current = null;
     };
-  }, [height]);
-
-  useEffect(() => {
-    linesRef.current = lines;
-    const hasPoints = lines.some((line) => line.points.length > 0);
-    const fit = hasPoints && resetRef.current !== resetKey;
-    if (fit) resetRef.current = resetKey;
-    handleRef.current?.setLines(lines, { fit });
-  }, [lines, resetKey]);
+  }, [height, handleRef]);
 
   return (
     <div className="chart-shell" ref={containerRef} style={{ height, minHeight: height }} />

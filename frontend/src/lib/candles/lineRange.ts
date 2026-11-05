@@ -45,6 +45,31 @@ export function lineRangeToWindow(range: LineRange): { from: string; to: string 
   };
 }
 
+/**
+ * Always returns the maximum available history window (365 days).
+ * Used for the initial full-history fetch — independent of the selected timeframe.
+ */
+export function lineFullHistoryWindow(): { from: string; to: string } {
+  const to = Date.now();
+  return {
+    from: new Date(to - LINE_ALL_LOOKBACK_MS).toISOString(),
+    to: new Date(to).toISOString(),
+  };
+}
+
+/**
+ * Returns the { from, to } seconds pair for setVisibleTimeRange.
+ * Returns undefined for ALL so the chart calls fitContent() instead.
+ */
+export function lineRangeViewport(
+  range: LineRange
+): { from: number; to: number } | undefined {
+  if (range === "ALL") return undefined;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const windowMs = lineRangeMs(range);
+  return { from: Math.floor((Date.now() - windowMs) / 1000), to: nowSec };
+}
+
 export function lineRangeMs(range: LineRange): number {
   switch (range) {
     case "1H":

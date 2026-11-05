@@ -729,7 +729,7 @@ class CandleAggregator {
           .gte('ts', fromIso)
           .lte('ts', toIso)
           .order('ts', { ascending: true })
-          .limit(400);
+          .limit(1500);
         if (error || !data?.length) return [];
         return data
           .map((row) => ({
@@ -758,7 +758,7 @@ class CandleAggregator {
         .gte('ts', fromIso)
         .lte('ts', toIso)
         .order('ts', { ascending: true })
-        .limit(400);
+        .limit(1500);
       if (error || !data?.length) return [];
       return data
         .map((row) => ({
