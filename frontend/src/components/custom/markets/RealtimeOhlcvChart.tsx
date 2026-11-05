@@ -132,6 +132,7 @@ export function RealtimeOhlcvChart({
   } | null>(null);
 
   const [status, setStatus] = useState<Status>("loading");
+  const statusRef = useRef<Status>("loading");
 
   // Chart instance once per height — survives market/resolution/tick changes.
   useEffect(() => {
@@ -176,6 +177,7 @@ export function RealtimeOhlcvChart({
     const handle = handleRef.current;
     const cfg = configRef.current;
     if (!handle || !historyReadyRef.current || !cfg) return;
+    if (statusRef.current === "empty") return;
 
     const now = Date.now();
     const bucket = bucketStartMs(now, cfg.bucketMs);
@@ -251,6 +253,7 @@ export function RealtimeOhlcvChart({
     historyReadyRef.current = false;
     const outcomeIndex = selectedOutcome > 0 ? selectedOutcome : 0;
     setStatus("loading");
+    statusRef.current = "loading";
 
     const bucketMs = RESOLUTION_MS[resolution];
     const ladder = SUB_INTERVAL_LADDER[resolution];
@@ -334,7 +337,9 @@ export function RealtimeOhlcvChart({
       if (token !== tokenRef.current) return null;
       completedRowsRef.current = completed;
       handleRef.current?.setHistory(completed, { fit });
-      return completed;
+      // Return both completed and total so callers can distinguish
+      // "all rows were the forming bucket" from "no data at all".
+      return { completed, totalFromDb: rows.length };
     };
 
     const refetchFiner = async (reason: string) => {
@@ -418,10 +423,14 @@ export function RealtimeOhlcvChart({
 
     const applyHistory = (fit: boolean) => {
       return loadHistory(fit)
-        .then((rows) => {
-          if (rows == null) return;
+        .then((result) => {
+          if (result == null) return;
           historyReadyRef.current = true;
-          setStatus(rows.length ? "ready" : "empty");
+          // Use totalFromDb: if any rows came from DB (even if all were the
+          // forming bucket and got stripped), the market has data — show ready.
+          const s = result.totalFromDb > 0 ? "ready" : "empty";
+          setStatus(s);
+          statusRef.current = s;
           void refetchFiner("initial");
         })
         .catch((err) => {
@@ -440,10 +449,12 @@ export function RealtimeOhlcvChart({
       resyncingRef.current = true;
       try {
         aggregatorRef.current?.reset();
-        const rows = await loadHistory(false);
-        if (rows == null || token !== tokenRef.current) return;
+        const result = await loadHistory(false);
+        if (result == null || token !== tokenRef.current) return;
         historyReadyRef.current = true;
-        setStatus(rows.length ? "ready" : "empty");
+        const s = result.totalFromDb > 0 ? "ready" : "empty";
+        setStatus(s);
+        statusRef.current = s;
         await refetchFiner("resync");
       } catch (err) {
         console.error("[RealtimeOhlcvChart] resync failed:", err);
