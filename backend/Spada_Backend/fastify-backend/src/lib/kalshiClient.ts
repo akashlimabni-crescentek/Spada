@@ -59,9 +59,16 @@ export function buildKalshiAuthHeaders(method: string, signPath: string): Record
   };
 }
 
+/** Cache 403/404 responses for 10 minutes to avoid hammering dead tickers. */
+const kalshiClientErrorCache = new Map<string, { status: number; at: number }>();
+const KALSHI_ERROR_CACHE_MS = 10 * 60 * 1000;
+
 /**
  * Authenticated GET to Kalshi trade API v2.
- * Both hosts are tried together; the first successful body wins.
+ * Tries the primary host first; only falls back to the secondary on network/timeout
+ * errors (not 4xx — a 403/404 from one host means the ticker is restricted/gone).
+ * 403 and 404 responses are cached for 10 minutes to avoid repeated calls for
+ * closed or delisted markets.
  * @param endpoint e.g. '/markets' or '/markets/{ticker}/orderbook'
  */
 export async function kalshiGet(
@@ -78,6 +85,13 @@ export async function kalshiGet(
   ).toString();
 
   const path = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+  const cacheKey = `${path}${queryString ? `?${queryString}` : ''}`;
+
+  const cachedErr = kalshiClientErrorCache.get(cacheKey);
+  if (cachedErr && Date.now() - cachedErr.at < KALSHI_ERROR_CACHE_MS) {
+    throw new Error(`[kalshiClient] GET ${path} ${cachedErr.status} (cached)`);
+  }
+
   const signPath = `${SIGN_PATH_PREFIX}${path}`;
   const headers = {
     ...buildKalshiAuthHeaders('GET', signPath),
@@ -86,35 +100,35 @@ export async function kalshiGet(
   };
 
   const hosts = [API_BASE, FALLBACK_API_BASE];
-  const errors: Error[] = [];
-  const attempts = hosts.map(async (host) => {
+  let lastError: Error | null = null;
+
+  for (const host of hosts) {
     const url = `${host}${path}${queryString ? `?${queryString}` : ''}`;
-    const response = await fetch(url, {
-      headers,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (err) {
+      // Network/timeout — try next host
+      lastError = err instanceof Error ? err : new Error(String(err));
+      continue;
+    }
+
     if (!response.ok) {
       const body = await response.text().catch(() => '');
-      throw new Error(
-        `[kalshiClient] GET ${path} ${response.status}${body ? `: ${body.slice(0, 200)}` : ''}`
-      );
-    }
-    return response.json();
-  });
-
-  try {
-    return await Promise.any(attempts);
-  } catch (err) {
-    if (err instanceof AggregateError) {
-      for (const e of err.errors) {
-        errors.push(e instanceof Error ? e : new Error(String(e)));
+      const msg = `[kalshiClient] GET ${path} ${response.status}${body ? `: ${body.slice(0, 200)}` : ''}`;
+      // 4xx means the ticker is bad/restricted — cache and stop, don't try fallback
+      if (response.status >= 400 && response.status < 500) {
+        kalshiClientErrorCache.set(cacheKey, { status: response.status, at: Date.now() });
+        throw new Error(msg);
       }
-    } else {
-      errors.push(err instanceof Error ? err : new Error(String(err)));
+      lastError = new Error(msg);
+      continue;
     }
+
+    return response.json();
   }
 
-  throw errors[errors.length - 1] ?? new Error(`[kalshiClient] GET ${path} failed`);
+  throw lastError ?? new Error(`[kalshiClient] GET ${path} failed`);
 }
 
 export interface KalshiMarketsPageOptions {

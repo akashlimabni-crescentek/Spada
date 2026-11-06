@@ -217,7 +217,10 @@ export async function fetchProviderStats(
       }
     }
   } catch (err: any) {
-    console.warn('[ratioEngine] provider stats failed:', err?.message ?? err);
+    const msg: string = err?.message ?? String(err);
+    if (!msg.includes('(cached)')) {
+      console.warn('[ratioEngine] provider stats failed:', msg.slice(0, 120));
+    }
   }
   return null;
 }
@@ -252,7 +255,7 @@ export async function fetchBestBidAsk(market: RatioMarketRow): Promise<{
   return { bid: null, ask: null, kalshiOrderbook: null, timestamp: null };
 }
 
-const RATIO_HEAVY_TTL_MS = 5_000;
+const RATIO_HEAVY_TTL_MS = 60_000;
 
 type RatioBook = {
   bid: number | null;
@@ -277,6 +280,7 @@ type RatioHeavySnapshot = {
 };
 
 const ratioHeavyCache = new Map<string, RatioHeavySnapshot>();
+const ratioHeavyInflight = new Map<string, Promise<RatioHeavySnapshot>>();
 
 export type RatioEngineDeps = {
   fetchProviderStats?: (m: RatioMarketRow) => Promise<ProviderMarketStats | null>;
@@ -333,46 +337,40 @@ export async function computeMarketRatios(
     candleRows = cached.candleRows;
     twinSnap = cached.twin;
   } else {
-    // Stats + book + candles first; match after currentProb is known (and can hit cache).
-    const [fetchedStats, fetchedBook, candles5m] = await Promise.all([
-      fetchStats(market),
-      fetchBook(market),
-      getCandles(market.canonical_id, '5m', from7d, now),
-    ]);
-    stats = fetchedStats;
-    book = fetchedBook;
-    candleRows = candles5m.map((c) => ({
-      ts: c.bucket,
-      close: c.close,
-      volume: c.volume,
-    }));
+    const doFetch = async (): Promise<RatioHeavySnapshot> => {
+      const [fetchedStats, fetchedBook, candles5m] = await Promise.all([
+        fetchStats(market),
+        fetchBook(market),
+        getCandles(market.canonical_id, '5m', from7d, now),
+      ]);
+      const rows = candles5m.map((c) => ({ ts: c.bucket, close: c.close, volume: c.volume }));
+      const seedProb = assembleCurrentProb(
+        storedYesPrice(market),
+        fetchedBook.bid,
+        fetchedBook.ask,
+        readLiveQuoteRecord(market.canonical_id)?.prices?.[0]
+      );
+      const crossMatch = await resolveMatch(market, seedProb);
+      let twin: RatioHeavySnapshot['twin'] = null;
+      if (crossMatch) {
+        const twinBook = await fetchBook(crossMatch.twin as RatioMarketRow);
+        twin = { match: crossMatch, bid: twinBook.bid, ask: twinBook.ask, timestamp: twinBook.timestamp ?? null };
+      }
+      const snap: RatioHeavySnapshot = { at: Date.now(), stats: fetchedStats, book: fetchedBook, candleRows: rows, twin };
+      ratioHeavyCache.set(market.canonical_id, snap);
+      return snap;
+    };
 
-    const seedProb = assembleCurrentProb(
-      storedYesPrice(market),
-      book.bid,
-      book.ask,
-      readLiveQuoteRecord(market.canonical_id)?.prices?.[0]
-    );
-    const crossMatch = await resolveMatch(market, seedProb);
-    if (crossMatch) {
-      const twinBook = await fetchBook(crossMatch.twin as RatioMarketRow);
-      twinSnap = {
-        match: crossMatch,
-        bid: twinBook.bid,
-        ask: twinBook.ask,
-        timestamp: twinBook.timestamp ?? null,
-      };
+    let job = usingDefaultDeps ? ratioHeavyInflight.get(market.canonical_id) : undefined;
+    if (!job) {
+      job = doFetch().finally(() => ratioHeavyInflight.delete(market.canonical_id));
+      if (usingDefaultDeps) ratioHeavyInflight.set(market.canonical_id, job);
     }
-
-    if (usingDefaultDeps) {
-      ratioHeavyCache.set(market.canonical_id, {
-        at: now,
-        stats,
-        book,
-        candleRows,
-        twin: twinSnap,
-      });
-    }
+    const snap = await job;
+    stats = snap.stats;
+    book = snap.book;
+    candleRows = snap.candleRows;
+    twinSnap = snap.twin;
   }
 
   const bestBid = book.bid;

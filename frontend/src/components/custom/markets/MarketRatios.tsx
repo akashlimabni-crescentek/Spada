@@ -452,6 +452,12 @@ export function MarketRatios({
             <RatioRow key={key} ratioKey={key} value={ratios[key]} />
           ))}
         </div>
+
+        <div className="ratio-legend ratio-muted">
+          <span style={{ color: "#3fb950" }}>● Green</span> = healthy / favorable
+          <span style={{ color: "#f85149", marginLeft: 8 }}>● Red</span> = stressed / unfavorable
+          <span style={{ color: "#d29922", marginLeft: 8 }}>● Yellow</span> = moderate
+        </div>
       </div>
     </Card>
   );

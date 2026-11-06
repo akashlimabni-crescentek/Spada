@@ -829,7 +829,10 @@ function seedKalshiPin(ticker: string): void {
       recordKalshiYesPrice(ticker, mid, { sourceTs });
     })
     .catch((err: any) => {
-      console.warn(`[Price Stream][Kalshi] pin snapshot ${ticker}:`, err?.message ?? err);
+      const msg: string = err?.message ?? String(err);
+      if (!msg.includes('(cached)')) {
+        console.warn(`[Price Stream][Kalshi] pin snapshot ${ticker}:`, msg.slice(0, 120));
+      }
     });
 }
 

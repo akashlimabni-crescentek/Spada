@@ -1,20 +1,15 @@
 "use client";
 
-import { useEffect, useRef } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { getApiBaseUrl } from "@/lib/apiBase";
 import { useMarketSubscription } from "@/providers/priceStreamConnector";
-import { usePriceStore } from "@/stores/usePriceStore";
+
 import type { MarketCross } from "@/types/ratios";
 
 export function useRatios(marketId: string | null) {
-  const liveYes = usePriceStore((state) =>
-    marketId ? state.prices[marketId]?.[0] : undefined
-  );
-
   const query = useQuery({
-    queryKey: ["ratios", marketId, liveYes ?? "none"],
+    queryKey: ["ratios", marketId],
     queryFn: async (): Promise<MarketCross> => {
       const base = getApiBaseUrl();
       if (!base) throw new Error("NEXT_PUBLIC_API_URL is not set");
@@ -24,8 +19,10 @@ export function useRatios(marketId: string | null) {
     },
     enabled: !!marketId,
     placeholderData: keepPreviousData,
-    // Book-driven fields (execution cost, Kalshi liquidity) change without a new price tick.
-    refetchInterval: 5_000,
+    staleTime: Infinity,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
   });
 
   const counterMarketId =
@@ -36,20 +33,6 @@ export function useRatios(marketId: string | null) {
       : null;
 
   useMarketSubscription(counterMarketId);
-
-  const counterYes = usePriceStore((state) =>
-    counterMarketId ? state.prices[counterMarketId]?.[0] : undefined
-  );
-
-  const prevCounterYesRef = useRef(counterYes);
-  useEffect(() => {
-    if (counterYes !== prevCounterYesRef.current) {
-      prevCounterYesRef.current = counterYes;
-      if (counterYes !== undefined) {
-        query.refetch();
-      }
-    }
-  }, [counterYes, query]);
 
   return query;
 }
